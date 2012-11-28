@@ -2,7 +2,7 @@
 #Use of this source code is governed by a BSD-style license that can be
 #found in the license.txt file.
 
-# leveldb server 
+# leveldb server
 import threading
 import zmq
 import leveldb
@@ -10,10 +10,12 @@ import json
 import optparse
 from time import sleep
 
+
 class workerThread(threading.Thread):
     """workerThread"""
     def __init__(self, context, db):
-        threading.Thread.__init__ (self)
+        threading.Thread.__init__(self)
+
         self.context = context
         self.db = db
         self.running = True
@@ -45,7 +47,7 @@ class workerThread(threading.Thread):
                 except:
                     value = ""
                 reply.append(value)
-                
+
             elif op == 'put':
                 try:
                     self.db.Put(data[0], data[1])
@@ -53,12 +55,12 @@ class workerThread(threading.Thread):
                 except:
                     value = ""
                 reply.append(value)
-                
+
             elif op == 'delete':
                 self.db.Delete(data)
                 value = ""
                 reply.append(value)
-                
+
             elif op == 'range':
                 start = data[0]
                 end = data[1]
@@ -97,15 +99,23 @@ if __name__ == "__main__":
         prog='leveldb-server.py',
         version='0.1.1',
         description='leveldb-server',
-        usage='%prog \n\t-p [port and host settings] Default: tcp://127.0.0.1:5147\n' + \
-                    '\t-f [database file name] Default: level.db')
-    optparser.add_option('--host', '-p', dest='host',
+        usage='%prog \n\t-p [port and host settings] '
+              'Default: tcp://127.0.0.1:5147\n'
+              '\t-f [database file name] Default: level.db')
+    optparser.add_option(
+        '--host', '-p', dest='host',
         default='tcp://127.0.0.1:5147')
-    optparser.add_option('--dbfile', '-d', dest='dbfile',
-        default='level.db')
+    optparser.add_option(
+        '--workers', '-w', dest='workers', type=int,
+        default=3)
+
+    optparser.add_option(
+        '--dbfiles', '-d', dest='dbfiles', nargs='+',
+        default='level.db', metavar='N',
+        help="Specify several database files")
     options, arguments = optparser.parse_args()
-    
-    if not (options.host and options.dbfile):
+
+    if not (options.host and options.dbfiles):
         optparser.print_help()
 
     print "Starting leveldb-server %s" % options.host
@@ -122,11 +132,13 @@ if __name__ == "__main__":
     db = leveldb.LevelDB(options.dbfile)
 
     workers = []
-    for i in xrange(3):
+    # TODO: iterate trhought dbs
+    # TODO: add all workers inside of workers to correctly shutdown later
+    for i in xrange(options.workers):
         worker = workerThread(context, db)
         worker.start()
         workers.append(worker)
-            
+
     try:
         while True:
             sockets = dict(poll.poll())
@@ -134,7 +146,7 @@ if __name__ == "__main__":
                 if sockets[frontend] == zmq.POLLIN:
                     msg = frontend.recv_multipart()
                     backend.send_multipart(msg)
-                    
+
             if backend in sockets:
                 if sockets[backend] == zmq.POLLIN:
                     msg = backend.recv_multipart()
@@ -145,4 +157,3 @@ if __name__ == "__main__":
         frontend.close()
         backend.close()
         context.term()
-
