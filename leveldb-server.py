@@ -13,8 +13,12 @@ import sys
 import zmq
 
 
-class workerThread(threading.Thread):
-    """workerThread"""
+class WorkerThread(threading.Thread):
+    """
+    General worker of leveldb server which
+    serve multiple databases and understand
+    commands for different databases
+    """
     def __init__(self, context, dbs):
         threading.Thread.__init__(self)
 
@@ -29,6 +33,9 @@ class workerThread(threading.Thread):
 
     def run(self):
         self.socket.connect('inproc://backend')
+
+        # TODO: if/elif looks like pascal-style code,
+        # it should be refactored to more clear and simple way
         while self.running:
             try:
                 msg = self.socket.recv_multipart()
@@ -124,7 +131,7 @@ def initialize(options):
 
     # add all workers inside of workers to correctly shutdown later
     for i in xrange(options.workers):
-        worker = workerThread(context, dbs)
+        worker = WorkerThread(context, dbs)
         worker.start()
         workers.append(worker)
 
