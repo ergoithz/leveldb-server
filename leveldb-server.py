@@ -11,6 +11,13 @@ import threading
 import time
 import sys
 import zmq
+import logging
+
+logger = logging.getLogger("leveldb-server")
+
+USAGE = """
+python leveldb-server.py
+"""
 
 
 class WorkerThread(threading.Thread):
@@ -23,9 +30,7 @@ class WorkerThread(threading.Thread):
         threading.Thread.__init__(self)
 
         self.context = context
-        # TODO: get database ID
-        self.dbs = {os.path.basename(db) for db in dbs}
-        import ipdb; ipdb.set_trace()
+        self.dbs = {name: db for db, name in dbs}
 
         self.running = True
         self.processing = False
@@ -53,33 +58,43 @@ class WorkerThread(threading.Thread):
             cur_db, op = msg[1].split(":")
             data = json.loads(msg[2])
             reply = [id]
+
+            logger.debug("Received command from client: {}".format(msg[1]))
+
             if op == 'get':
                 try:
-                    value = self.db.Get(data)
+                    value = self.dbs.get(cur_db).Get(data)
                 except:
                     value = ""
                 reply.append(value)
 
             elif op == 'put':
                 try:
-                    self.db.Put(data[0], data[1])
+                    self.dbs.get(cur_db).Put(data[0], data[1])
                     value = "True"
                 except:
                     value = ""
                 reply.append(value)
 
             elif op == 'delete':
-                self.db.Delete(data)
+                self.dbs.get(cur_db).Delete(data)
                 value = ""
                 reply.append(value)
 
+            # TODO: Here we should teach return chunket resultset and
+            # (probably) we should be able to control amount of data which
+            # we want to return per one chunk (also, maybe limit/offset ?)
             elif op == 'range':
                 start = data[0]
                 end = data[1]
+                # FIXME: This whole code part is fucked up
                 if start and end:
                     try:
                         arr = []
-                        for value in self.db.RangeIter(start, end):
+                        # TODO: this is bullshit, need to
+                        # be refactored to make ability to streap results
+                        for value in self.dbs.get(
+                                cur_db).RangeIter(start, end):
                             arr.append({value[0]: value[1]})
                         reply.append(json.dumps(arr))
                     except:
@@ -88,7 +103,10 @@ class WorkerThread(threading.Thread):
                 else:
                     try:
                         arr = []
-                        for value in self.db.RangeIter():
+                        # TODO: this is bullshit, need to
+                        # be refactored to stream results
+                        for value in self.dbs.get(cur_db).RangeIter():
+                            print value
                             arr.append({value[0]: value[1]})
                         reply.append(json.dumps(arr))
                     except:
@@ -111,10 +129,10 @@ def initialize(options):
     """
     Initialize LevelDB Server
     """
-    print "Starting leveldb-server %s" % options.host
+    print "Starting leveldb-server %s" % options.listen
     context = zmq.Context()
     frontend = context.socket(zmq.XREP)
-    frontend.bind(options.host)
+    frontend.bind(options.listen)
     backend = context.socket(zmq.XREQ)
     backend.bind('inproc://backend')
 
@@ -126,8 +144,12 @@ def initialize(options):
     dbs = []
 
     # NB: iterate trhought dbs
-    for dbfile in options.dbfiles:
-        dbs.append(leveldb.LevelDB(dbfile))
+    for dbfile in options.dbfiles.split(","):
+        name = os.path.basename(dbfile)
+        dbs.append((leveldb.LevelDB(dbfile), name))
+
+    print "Initialized databases: {}".format(
+        ", ".join(map(lambda d: d[1], dbs)))
 
     # add all workers inside of workers to correctly shutdown later
     for i in xrange(options.workers):
@@ -156,27 +178,29 @@ def initialize(options):
 
 
 if __name__ == "__main__":
+    # force to debug mode
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(logging.StreamHandler())
+
     optparser = optparse.OptionParser(
         prog='leveldb-server.py',
         version='0.1.1',
         description='leveldb-server',
-        usage='%prog \n\t-p [port and host settings] '
-              'Default: tcp://127.0.0.1:5147\n'
-              '\t-f [database file name] Default: level.db')
+        usage=USAGE)
     optparser.add_option(
-        '--host', '-p', dest='host',
+        '--listen', '-l', dest='listen',
         default='tcp://127.0.0.1:5147')
     optparser.add_option(
         '--workers', '-w', dest='workers', type=int,
         default=3)
 
     optparser.add_option(
-        '--dbfiles', '-d', dest='dbfiles', nargs='+', type=str,
-        default='level.db', metavar='N',
-        help="Specify several database files")
+        '--dbfiles',
+        default='level.db',
+        help="Specify several comma-separated database files")
     options, arguments = optparser.parse_args()
 
-    if not (options.host and options.dbfiles):
+    if not (options.listen and options.dbfiles):
         optparser.print_help()
         sys.exit(1)
 
