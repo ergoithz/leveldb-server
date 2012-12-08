@@ -12,12 +12,55 @@ import time
 import sys
 import zmq
 import logging
+import struct
 
 logger = logging.getLogger("leveldb-server")
 
 USAGE = """
 python leveldb-server.py
 """
+
+
+class Commands(object):
+    """
+    Database commands abstraction layer
+    """
+    def __init__(self, db):
+        self.db = db
+
+    def _encode(self, *args):
+        # pack into binary protocol
+        args = [unicode(a).encode("utf-8") for a in args]
+
+        #return "{0:0=10d}{1}".format(len(data), data)
+        return "".join([struct.pack(r"Q", len(data)) + data for data in args])
+
+    def get(self, data):
+        try:
+            return list(self._encode(self.db.Get(data)))[0]
+        except KeyError:
+            return self._encode('')
+
+    def put(self, data):
+        # should be strings only
+        data = [unicode(d) for d in data]
+        yield self._encode(self.db.Put(data[0], data[1]))
+
+    def delete(self, data):
+        yield self._encode(self.db.Delete(data))
+
+    def range(self, data):
+        try:
+            if data[0] is None or data[1] is None:
+                raise IndexError
+
+            args = [data[0], data[1]]
+        except IndexError:
+            args = []
+
+        for value in self.db.RangeIter(*args):
+            # name, value
+            yield self._encode(value[0], value[1])
 
 
 class WorkerThread(threading.Thread):
@@ -30,7 +73,7 @@ class WorkerThread(threading.Thread):
         threading.Thread.__init__(self)
 
         self.context = context
-        self.dbs = {name: db for db, name in dbs}
+        self.dbs = {name: Commands(db) for db, name in dbs}
 
         self.running = True
         self.processing = False
@@ -49,73 +92,24 @@ class WorkerThread(threading.Thread):
                 continue
 
             self.processing = True
-            if  len(msg) != 3:
+
+            if len(msg) != 3:
                 value = 'None'
                 reply = [msg[0], value]
                 self.socket.send_multipart(reply)
                 continue
+
             id = msg[0]
             cur_db, op = msg[1].split(":")
             data = json.loads(msg[2])
             reply = [id]
 
             logger.debug("Received command from client: {}".format(msg[1]))
+            db = self.dbs.get(cur_db)
+            for chunk in getattr(db, op)(data):
+                logger.debug("Generating output: %s" % str(chunk))
+                self.socket.send_multipart([msg[0], chunk])
 
-            if op == 'get':
-                try:
-                    value = self.dbs.get(cur_db).Get(data)
-                except:
-                    value = ""
-                reply.append(value)
-
-            elif op == 'put':
-                try:
-                    self.dbs.get(cur_db).Put(data[0], data[1])
-                    value = "True"
-                except:
-                    value = ""
-                reply.append(value)
-
-            elif op == 'delete':
-                self.dbs.get(cur_db).Delete(data)
-                value = ""
-                reply.append(value)
-
-            # TODO: Here we should teach return chunket resultset and
-            # (probably) we should be able to control amount of data which
-            # we want to return per one chunk (also, maybe limit/offset ?)
-            elif op == 'range':
-                start = data[0]
-                end = data[1]
-                # FIXME: This whole code part is fucked up
-                if start and end:
-                    try:
-                        arr = []
-                        # TODO: this is bullshit, need to
-                        # be refactored to make ability to streap results
-                        for value in self.dbs.get(
-                                cur_db).RangeIter(start, end):
-                            arr.append({value[0]: value[1]})
-                        reply.append(json.dumps(arr))
-                    except:
-                        value = ""
-                        reply.append(value)
-                else:
-                    try:
-                        arr = []
-                        # TODO: this is bullshit, need to
-                        # be refactored to stream results
-                        for value in self.dbs.get(cur_db).RangeIter():
-                            print value
-                            arr.append({value[0]: value[1]})
-                        reply.append(json.dumps(arr))
-                    except:
-                        value = ""
-                        reply.append(value)
-            else:
-                value = ""
-                reply.append(value)
-            self.socket.send_multipart(reply)
             self.processing = False
 
     def close(self):
