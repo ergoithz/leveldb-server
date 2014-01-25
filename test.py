@@ -1,6 +1,6 @@
 import unittest
 
-from database import leveldb
+from client import leveldb
 
 
 class TestLeveldb(unittest.TestCase):

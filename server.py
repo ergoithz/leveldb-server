@@ -3,30 +3,24 @@
 #found in the license.txt file.
 
 # leveldb server
-import leveldb
-import json
-import optparse
+
 import os
-import threading
-import time
-import sys
-import zmq
 import logging
 import struct
 
-logger = logging.getLogger("leveldb-server")
+import leveldb
+import gevent
+import gevent.core
+import zmq.green as zmq
+import msgpack
 
-USAGE = """
-python leveldb-server.py
-"""
-
-
-class Commands(object):
+class Database(object):
     """
     Database commands abstraction layer
     """
-    def __init__(self, db):
-        self.db = db
+    def __init__(self, dbfile, name=None):
+        self.name = os.path.basename(dbfile) if name is None else name
+        self.db = leveldb.LevelDB(dbfile)
 
     def _encode(self, *args):
         # pack into binary protocol
@@ -63,21 +57,21 @@ class Commands(object):
             yield self._encode(value[0], value[1])
 
 
-class WorkerThread(threading.Thread):
+class Worker(object):
     """
     General worker of leveldb server which
     serve multiple databases and understand
     commands for different databases
     """
     def __init__(self, context, dbs):
-        threading.Thread.__init__(self)
-
         self.context = context
-        self.dbs = {name: Commands(db) for db, name in dbs}
+        self.dbs = dbs
 
         self.running = True
         self.processing = False
         self.socket = self.context.socket(zmq.XREQ)
+
+        gevent.spawn(self)
 
     def run(self):
         self.socket.connect('inproc://backend')
@@ -101,7 +95,7 @@ class WorkerThread(threading.Thread):
 
             id = msg[0]
             cur_db, op = msg[1].split(":")
-            data = json.loads(msg[2])
+            data = msgpack.loads(msg[2])
             reply = [id]
 
             logger.debug("Received command from client: {}".format(msg[1]))
@@ -115,87 +109,81 @@ class WorkerThread(threading.Thread):
     def close(self):
         self.running = False
         while self.processing:
-            time.sleep(1)
+            gevent.sleep()
         self.socket.close()
 
 
-def initialize(options):
-    """
-    Initialize LevelDB Server
-    """
-    print "Starting leveldb-server %s" % options.listen
-    context = zmq.Context()
-    frontend = context.socket(zmq.XREP)
-    frontend.bind(options.listen)
-    backend = context.socket(zmq.XREQ)
-    backend.bind('inproc://backend')
+class Server(object):
+    def __init__(self, listen, dbfiles, workers):
+        logging.info("Starting leveldb-server %s" % listen)
 
-    poll = zmq.Poller()
-    poll.register(frontend, zmq.POLLIN)
-    poll.register(backend,  zmq.POLLIN)
+        self.context = zmq.Context()
+        self.frontend = self.context.socket(zmq.XREP)
+        self.frontend.bind(listen)
+        self.backend = self.context.socket(zmq.XREQ)
+        self.backend.bind('inproc://backend')
 
-    workers = []
-    dbs = []
+        self.poll = zmq.Poller()
+        self.poll.register(self.frontend, zmq.POLLIN)
+        self.poll.register(self.backend,  zmq.POLLIN)
 
-    # NB: iterate trhought dbs
-    for dbfile in options.dbfiles.split(","):
-        name = os.path.basename(dbfile)
-        dbs.append((leveldb.LevelDB(dbfile), name))
+        self.dbs = {db.name: db for db in (Database(dbfile) for dbfile in dbfiles)}
 
-    print "Initialized databases: {}".format(
-        ", ".join(map(lambda d: d[1], dbs)))
+        logger.info("Initialized databases: %s" % ", ".join(self.dbs))
 
-    # add all workers inside of workers to correctly shutdown later
-    for i in xrange(options.workers):
-        worker = WorkerThread(context, dbs)
-        worker.start()
-        workers.append(worker)
+        self.workers = [Worker(self.context, self.dbs) for _ in xrange(workers)]
 
-    try:
+        gevent.spawn(self.run)
+
+    def run(self):
         while True:
-            sockets = dict(poll.poll())
-            if frontend in sockets:
-                if sockets[frontend] == zmq.POLLIN:
-                    msg = frontend.recv_multipart()
-                    backend.send_multipart(msg)
+            frontend = None
+            backend = None
 
-            if backend in sockets:
-                if sockets[backend] == zmq.POLLIN:
-                    msg = backend.recv_multipart()
-                    frontend.send_multipart(msg)
-    except KeyboardInterrupt:
-        for worker in workers:
+            for socket, type in self.poll.poll():
+                if socket == self.frontend:
+                    frontend = socket, type
+                elif socket == self.backend:
+                    backend = socket, type
+
+            if frontend and frontend[1] == zmq.POLLIN:
+                msg = frontend[0].recv_multipart()
+                backend.send_multipart(msg)
+
+            if backend and backend[1] == zmq.POLLIN:
+                msg = backend[0].recv_multipart()
+                frontend.send_multipart(msg)
+
+    def close(self):
+        for worker in self.workers:
             worker.close()
-        frontend.close()
-        backend.close()
-        context.term()
+        self.frontend.close()
+        self.backend.close()
+        self.context.term()
 
+logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
     # force to debug mode
-    logger.setLevel(logging.DEBUG)
-    logger.addHandler(logging.StreamHandler())
 
-    optparser = optparse.OptionParser(
-        prog='leveldb-server.py',
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog='server.py',
         version='0.1.1',
-        description='leveldb-server',
-        usage=USAGE)
-    optparser.add_option(
-        '--listen', '-l', dest='listen',
-        default='tcp://127.0.0.1:5147')
-    optparser.add_option(
-        '--workers', '-w', dest='workers', type=int,
-        default=3)
+        description='leveldb-server'
+    )
+    parser.add_argument("--listen", "-l", dest="listen", default="tcp://127.0.0.1:5147")
+    parser.add_argument("--workers", "-w", dest="workers", type=int, default=3)
+    parser.add_argument("--dbfiles", default="level.db", help="Specify several comma-separated database files")
+    parser.add_argument("--verbose", "-v", type=bool, help="Show debug messages")
 
-    optparser.add_option(
-        '--dbfiles',
-        default='level.db',
-        help="Specify several comma-separated database files")
-    options, arguments = optparser.parse_args()
+    args = parser.parse_args()
 
-    if not (options.listen and options.dbfiles):
-        optparser.print_help()
-        sys.exit(1)
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(logging.StreamHandler())
 
-    initialize(options)
+    server = Server(parser.listen, parser.dbfiles, parser.workers)
+    gevent.core.loop()
+    server.close()
