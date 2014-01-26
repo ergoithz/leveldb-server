@@ -5,149 +5,149 @@ import os
 import logging
 import types
 
-import leveldb
-
 import gevent
-import gevent.core
+import gevent.threadpool
+
+import leveldb
 import zmq.green as zmq
 
 __app__ = "High Performance LevelDB Server"
-__version__ = "0.2.0"
+__version__ = "0.2.0-dev"
 __author__ = "Felipe A. Hernandez <ergoithz@gmail.com>"
 __license__ = "BSD"
 
 class Database(object):
-    """
-    Database object with commands abstraction layer
-    """
-    def __init__(self, dbfile, name=None):
+    '''
+    LevelDB abstraction layer.
+
+    Operations runs asynchronously onto a threadpool for not blocking gevent.
+    '''
+    def __init__(self, dbfile, name=None, pool_size=5):
         self.name = os.path.basename(dbfile) if name is None else name
         self.db = leveldb.LevelDB(dbfile)
+        self.pool = gevent.threadpool.ThreadPool(pool_size)
+
+    def async(self, fnc, *args):
+        return self.pool.apply_e(BaseException, fnc, args)
 
     def get(self, key):
-        try:
-            return self.db.Get(key)
-        except KeyError:
-            return None
+        return self.async(self.db.Get, key)
 
     def put(self, key, value):
-        return self.db.Put(key, value)
+        return self.async(self.db.Put, key, value)
 
     def delete(self, key):
-        try:
-            return self.db.Delete(key)
-        except KeyError:
-            return None
+        return self.async(self.db.Delete, key)
 
     def range(self, start=None, end=None):
-        for key, value in self.db.RangeIter(start, end):
-            yield key, value
-
-
-class Worker(object):
-    """
-    General worker of leveldb server which serve multiple databases
-    """
-    def __init__(self, context, dbs):
-        self.context = context
-        self.dbs = dbs
-
-        self.running = True
-        self.processing = False
-        self.socket = self.context.socket(zmq.XREQ)
-
-        gevent.spawn(self.run)
-
-    def send(self, id, value):
-        '''
-        Sends value to client with given id taking care of different value type uses cases.
-
-        Type flag::
-            \0 None (key not found)
-            \1 None (stop iteration)
-            \xFE Single return argument
-            \xFF Multiple return argument
-
-        '''
-        if isinstance(value, basestring):
-            self.socket.send_multipart((id, "\xFE", value))
-        elif isinstance(value, tuple):
-            self.socket.send_multipart((id, "\xFF") + value)
-        elif isinstance(value, types.GeneratorType):
-            for chunk in value:
-                self.send(id, chunk)
-            self.socket.send_multipart((id, "\1"))
-        elif value is None:
-            self.socket.send_multipart((id, "\0"))
-        else:
-            logging.error("Cannot send value %r" % (value,))
-
-    def run(self):
-        self.socket.connect('inproc://backend')
-
-        try:
-            while self.running:
-                msg = self.socket.recv_multipart()
-
-                self.processing = True
-                id, dbname, dbop = msg[:3]
-                args = msg[3:]
-
-                logger.debug("Received command from client: %s:%s" % (dbname, dbop))
-
-                self.send(id, getattr(self.dbs[dbname], dbop)(*args))
-                self.processing = False
-        except zmq.ZMQError as e:
-            logging.exception(e)
-        self.running = False
-
-    def close(self):
-        self.running = False
-        while self.processing:
-            gevent.sleep()
-        self.socket.close()
+        op = self.async(self.db.RangeIter, start, end)
+        while True:
+            yield self.async(op.next)
 
 
 class Server(object):
-    def __init__(self, listen, dbfiles, workers):
+    '''
+    Server class.
+    '''
+    class SendSwitchType(object):
+        '''
+        Python switch-like for sending data..
+        '''
+        def __init__(self):
+            self.options = {
+                # Types
+                types.NoneType: self.none,
+                types.StringType: self.string,
+                types.TupleType: self.string_tuple,
+                types.GeneratorType: self.generator,
+                KeyError: self.key_error,
+                }
+
+        def __call__(self, socket, id, value):
+            self.options.get(type(value), self.default)(socket, id, value)
+
+        def key_error(self, socket, id, value):
+            socket.send_multipart((id, "\2", value.message) + value.args)
+
+        def string(self, socket, id, value):
+            socket.send_multipart((id, "\xFE", value))
+
+        def string_tuple(self, socket, id, value):
+            socket.send_multipart((id, "\xFF") + value)
+
+        def generator(self, socket, id, value):
+            for chunk in value:
+                self(socket, id, chunk)
+            socket.send_multipart((id, "\1"))
+
+        def none(self, socket, id, value):
+            socket.send_multipart((id, "\0"))
+
+        def default(self, socket, id, value):
+            if isinstance(value, BaseException):
+                # Send generic exception
+                socket.send_multipart((id, "\xFB", value.message) + value.args)
+            else:
+                logging.error("Cannot send value %r" % (value,))
+
+    send = staticmethod(SendSwitchType())
+
+    def __init__(self, listen, dbfiles):
         logging.info("Starting leveldb-server %s" % listen)
 
         self.context = zmq.Context()
         self.frontend = self.context.socket(zmq.XREP)
         self.frontend.bind(listen)
-        self.backend = self.context.socket(zmq.XREQ)
-        self.backend.bind('inproc://backend')
 
         self.poll = zmq.Poller()
         self.poll.register(self.frontend, zmq.POLLIN)
-        self.poll.register(self.backend,  zmq.POLLIN)
 
         self.dbs = {db.name: db for db in (Database(dbfile) for dbfile in dbfiles)}
 
         logger.info("Initialized databases: %s" % ", ".join(self.dbs))
 
-        self.workers = [Worker(self.context, self.dbs) for _ in xrange(workers)]
+        self._run = False
+        self._running = False
 
-        gevent.spawn(self.run)
+    def recv(self, socket):
+        message = socket.recv_multipart()
+        id, dbname, dbop = message[:3]
+        return id, dbname, dbop, message[3:]
 
-    def run(self):
-        while True:
-            for socket, type in self.poll.poll():
-                if type == zmq.POLLIN:
-                    if socket == self.frontend:
-                        forward = self.backend
-                    elif socket == self.backend:
-                        forward = self.frontend
-                    else:
-                        continue
-                    msg = socket.recv_multipart()
-                    forward.send_multipart(msg)
+    def task(self, socket):
+        id, dbname, dbop, args = self.recv(socket)
+        logger.debug("Received command from client: %s:%s" % (dbname, dbop))
+        try:
+            data = getattr(self.dbs[dbname], dbop)(*args)
+        except BaseException as e:
+            data = e
+        self.send(socket, id, data)
+
+    def main(self):
+        '''
+        Server mainloop.
+        '''
+        self._run = True
+        self._running = True
+        while self._run:
+            for socket, type in self.poll.poll(timeout=1):
+                self.task(socket)
+        self._running = False
+
+    def stop(self):
+        '''
+        Stop mainloop
+        '''
+        self._run = False
 
     def close(self):
-        for worker in self.workers:
-            worker.close()
+        '''
+        Stop mainloop if running and close descriptors.
+        '''
+        self.stop()
+        while self._running:
+            gevent.sleep()
         self.frontend.close()
-        self.backend.close()
         self.context.term()
 
 logger = logging.getLogger(__name__)
@@ -156,16 +156,14 @@ if __name__ == "__main__":
     import argparse
     import signal
 
-    events_received = []
-
     def event(event, stack):
-        events_received.append(event)
+        server.stop()
+
     signal.signal(signal.SIGTERM, event)
 
     parser = argparse.ArgumentParser(version=__version__, description=__app__)
     parser.add_argument("listen", metavar="tcp://127.0.0.1:5147", help="zmq listen address")
     parser.add_argument("dbfiles", metavar="level.db", nargs="+", help="database files")
-    parser.add_argument("-w", "--workers", metavar="N", type=int, default=2, help="number of workers (defaults to 2)")
     parser.add_argument("--verbose", action="store_true", help="show debug messages")
     args = parser.parse_args()
 
@@ -173,11 +171,9 @@ if __name__ == "__main__":
         logger.setLevel(logging.DEBUG)
         logger.addHandler(logging.StreamHandler())
 
-    server = Server(args.listen, args.dbfiles, args.workers)
-
+    server = Server(args.listen, args.dbfiles)
     try:
-        while not events_received:
-            gevent.sleep()
+        server.main()
     except KeyboardInterrupt:
         print " CTRL+C received. Stoping."
     server.close()

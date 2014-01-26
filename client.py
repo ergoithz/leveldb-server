@@ -1,7 +1,44 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 class LevelDB(object):
+    class ParserSwitchType(object):
+        def __init__(self):
+            self.codes = {
+                "\0": self.none, # Special meaning: StopIteration
+                "\1": self.none,
+                "\2": self.key_error,
+                "\xFB": self.exception,
+                "\xFE": self.string,
+                "\xFF": self.string_tuple,
+                }
+
+        def __call__(self, data):
+            return self.codes.get(data[0], self.default)(data)
+
+        def none(self, data):
+            return None
+
+        def key_error(self, data):
+            raise KeyError(*data[1:])
+
+        def exception(self, data):
+            raise Exception(*data[1:])
+
+        def string(self, data):
+            return data[1]
+
+        def string_tuple(self, data):
+            return data[1:]
+
+        def default(self, data):
+            logger.error("Could not parse server message %r" % data)
+
+    parse = staticmethod(ParserSwitchType())
 
     def __init__(self, host, database, timeout=3, gevent=False):
         self.host = host
@@ -21,15 +58,6 @@ class LevelDB(object):
         params = [self.database, cmd]
         params.extend(str(i) for i in args)
         self.socket.send_multipart(params)
-
-    parsers = {
-        "\0": lambda x: None, # Means key not found
-        "\1": lambda x: None, # Means stop iteration
-        "\xFE": lambda x: x[1],
-        "\xFF": lambda x: x[1:],
-        }
-    def parse(self, data):
-        return self.parsers[data[0]](data)
 
     def recv(self):
         return self.parse(self.socket.recv_multipart())
