@@ -2,9 +2,9 @@ leveldb-server
 =============
 
 * Async leveldb server and client based on zeromq
-* Storage engine *"leveldb":http://code.google.com/p/leveldb/*
-* Networking library *"zeromq":http://www.zeromq.org/*
-* Server based on gevent for massive concurrency.
+* Storage engine *leveldb*. http://code.google.com/p/leveldb/
+* Networking library *zeromq*. http://www.zeromq.org/
+* Server based on *gevent* for massive concurrency. http://www.gevent.org/
 * Client compatible with gevent.
 
 License
@@ -26,6 +26,7 @@ Feature
 * Easy polyglot client bindings. See *"zmq bindings":http://www.zeromq.org/bindings:_start*
 
 ::
+
     db.put("k3", "v3")
     db.get("k3")
     # "v3"
@@ -56,12 +57,14 @@ serious project for easing deployment and dependency isolation.
 
 # Install dependencies
 ::
+
     pip install -r requirements.txt
 
 Using the "leveldb-client-py":https://github.com/ergoithz/leveldb-server/blob/master/client.py
 -------------
 
 ::
+
     from leveldb_server import client
     db = client.LevelDB()
     db.get("Key")
@@ -70,10 +73,12 @@ Using the "leveldb-client-py":https://github.com/ergoithz/leveldb-server/blob/ma
     db.range(start, end)
     db.delete("K")
 
-
 Backups
 =============
+
+LevelDB stores database into a single file.
 ::
+
     cp -rpf level.db backup.db
 
 Known issues and work in progress
