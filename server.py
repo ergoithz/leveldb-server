@@ -1,67 +1,52 @@
-#Copyright (c) 2011 Fabula Solutions. All rights reserved.
-#Use of this source code is governed by a BSD-style license that can be
-#found in the license.txt file.
-
-# leveldb server
+#!/usr/bin/env python
+# -*- coding: UTF-8 -*-
 
 import os
 import logging
-import struct
+import types
 
 import leveldb
+
 import gevent
 import gevent.core
 import zmq.green as zmq
-import msgpack
+
+__app__ = "High Performance LevelDB Server"
+__version__ = "0.2.0"
+__author__ = "Felipe A. Hernandez <ergoithz@gmail.com>"
+__license__ = "BSD"
 
 class Database(object):
     """
-    Database commands abstraction layer
+    Database object with commands abstraction layer
     """
     def __init__(self, dbfile, name=None):
         self.name = os.path.basename(dbfile) if name is None else name
         self.db = leveldb.LevelDB(dbfile)
 
-    def _encode(self, *args):
-        # pack into binary protocol
-        args = [unicode(a).encode("utf-8") for a in args]
-
-        #return "{0:0=10d}{1}".format(len(data), data)
-        return "".join([struct.pack(r"Q", len(data)) + data for data in args])
-
-    def get(self, data):
+    def get(self, key):
         try:
-            return list(self._encode(self.db.Get(data)))[0]
+            return self.db.Get(key)
         except KeyError:
-            return self._encode('')
+            return None
 
-    def put(self, data):
-        # should be strings only
-        data = [unicode(d) for d in data]
-        yield self._encode(self.db.Put(data[0], data[1]))
+    def put(self, key, value):
+        return self.db.Put(key, value)
 
-    def delete(self, data):
-        yield self._encode(self.db.Delete(data))
-
-    def range(self, data):
+    def delete(self, key):
         try:
-            if data[0] is None or data[1] is None:
-                raise IndexError
+            return self.db.Delete(key)
+        except KeyError:
+            return None
 
-            args = [data[0], data[1]]
-        except IndexError:
-            args = []
-
-        for value in self.db.RangeIter(*args):
-            # name, value
-            yield self._encode(value[0], value[1])
+    def range(self, start=None, end=None):
+        for key, value in self.db.RangeIter(start, end):
+            yield key, value
 
 
 class Worker(object):
     """
-    General worker of leveldb server which
-    serve multiple databases and understand
-    commands for different databases
+    General worker of leveldb server which serve multiple databases
     """
     def __init__(self, context, dbs):
         self.context = context
@@ -71,40 +56,50 @@ class Worker(object):
         self.processing = False
         self.socket = self.context.socket(zmq.XREQ)
 
-        gevent.spawn(self)
+        gevent.spawn(self.run)
+
+    def send(self, id, value):
+        '''
+        Sends value to client with given id taking care of different value type uses cases.
+
+        Type flag::
+            \0 None (key not found)
+            \1 None (stop iteration)
+            \xFE Single return argument
+            \xFF Multiple return argument
+
+        '''
+        if isinstance(value, basestring):
+            self.socket.send_multipart((id, "\xFE", value))
+        elif isinstance(value, tuple):
+            self.socket.send_multipart((id, "\xFF") + value)
+        elif isinstance(value, types.GeneratorType):
+            for chunk in value:
+                self.send(id, chunk)
+            self.socket.send_multipart((id, "\1"))
+        elif value is None:
+            self.socket.send_multipart((id, "\0"))
+        else:
+            logging.error("Cannot send value %r" % (value,))
 
     def run(self):
         self.socket.connect('inproc://backend')
 
-        # TODO: if/elif looks like pascal-style code,
-        # it should be refactored to more clear and simple way
-        while self.running:
-            try:
+        try:
+            while self.running:
                 msg = self.socket.recv_multipart()
-            except zmq.ZMQError:
-                self.running = False
-                continue
 
-            self.processing = True
+                self.processing = True
+                id, dbname, dbop = msg[:3]
+                args = msg[3:]
 
-            if len(msg) != 3:
-                value = 'None'
-                reply = [msg[0], value]
-                self.socket.send_multipart(reply)
-                continue
+                logger.debug("Received command from client: %s:%s" % (dbname, dbop))
 
-            id = msg[0]
-            cur_db, op = msg[1].split(":")
-            data = msgpack.loads(msg[2])
-            reply = [id]
-
-            logger.debug("Received command from client: {}".format(msg[1]))
-            db = self.dbs.get(cur_db)
-            for chunk in getattr(db, op)(data):
-                logger.debug("Generating output: %s" % str(chunk))
-                self.socket.send_multipart([msg[0], chunk])
-
-            self.processing = False
+                self.send(id, getattr(self.dbs[dbname], dbop)(*args))
+                self.processing = False
+        except zmq.ZMQError as e:
+            logging.exception(e)
+        self.running = False
 
     def close(self):
         self.running = False
@@ -137,22 +132,16 @@ class Server(object):
 
     def run(self):
         while True:
-            frontend = None
-            backend = None
-
             for socket, type in self.poll.poll():
-                if socket == self.frontend:
-                    frontend = socket, type
-                elif socket == self.backend:
-                    backend = socket, type
-
-            if frontend and frontend[1] == zmq.POLLIN:
-                msg = frontend[0].recv_multipart()
-                backend.send_multipart(msg)
-
-            if backend and backend[1] == zmq.POLLIN:
-                msg = backend[0].recv_multipart()
-                frontend.send_multipart(msg)
+                if type == zmq.POLLIN:
+                    if socket == self.frontend:
+                        forward = self.backend
+                    elif socket == self.backend:
+                        forward = self.frontend
+                    else:
+                        continue
+                    msg = socket.recv_multipart()
+                    forward.send_multipart(msg)
 
     def close(self):
         for worker in self.workers:
@@ -164,26 +153,31 @@ class Server(object):
 logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
-    # force to debug mode
-
     import argparse
+    import signal
 
-    parser = argparse.ArgumentParser(
-        prog='server.py',
-        version='0.1.1',
-        description='leveldb-server'
-    )
-    parser.add_argument("--listen", "-l", dest="listen", default="tcp://127.0.0.1:5147")
-    parser.add_argument("--workers", "-w", dest="workers", type=int, default=3)
-    parser.add_argument("--dbfiles", default="level.db", help="Specify several comma-separated database files")
-    parser.add_argument("--verbose", "-v", type=bool, help="Show debug messages")
+    events_received = []
 
+    def event(event, stack):
+        events_received.append(event)
+    signal.signal(signal.SIGTERM, event)
+
+    parser = argparse.ArgumentParser(version=__version__, description=__app__)
+    parser.add_argument("listen", metavar="tcp://127.0.0.1:5147", help="zmq listen address")
+    parser.add_argument("dbfiles", metavar="level.db", nargs="+", help="database files")
+    parser.add_argument("-w", "--workers", metavar="N", type=int, default=2, help="number of workers (defaults to 2)")
+    parser.add_argument("--verbose", action="store_true", help="show debug messages")
     args = parser.parse_args()
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
         logger.addHandler(logging.StreamHandler())
 
-    server = Server(parser.listen, parser.dbfiles, parser.workers)
-    gevent.core.loop()
+    server = Server(args.listen, args.dbfiles, args.workers)
+
+    try:
+        while not events_received:
+            gevent.sleep()
+    except KeyboardInterrupt:
+        print " CTRL+C received. Stoping."
     server.close()
