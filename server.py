@@ -1,17 +1,29 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
+'''
+ZeroMQ LevelDB Server
+A python ZeroMQ LevelDB Server.
+
+Current py-LevelDB implementation is a bottleneck for any sophisticaced,
+thread-based, gevent-based or asynchronous server, thus after a lot of
+benchmarking I decided to trim down and reduce server code to minimum.
+'''
 
 import os
+import os.path
+import signal
 import logging
-import types
+import errno
+import time
+import functools
+import collections
 
-import gevent
-import gevent.threadpool
-
+import msgpack
 import leveldb
+import gevent
 import zmq.green as zmq
 
-__app__ = "High Performance LevelDB Server"
+__app__ = "ZeroMQ LevelDB Server"
 __version__ = "0.2.0-dev"
 __author__ = "Felipe A. Hernandez <ergoithz@gmail.com>"
 __license__ = "BSD"
@@ -20,146 +32,186 @@ class Database(object):
     '''
     LevelDB abstraction layer.
 
-    Operations runs asynchronously onto a threadpool for not blocking gevent.
+    LevelDB methods have ugly names, this class wraps them with pythonic ones,
+    lowercased and underscored instead of capitalized and camelcased. This way,
+    'Get' becomes 'get' and 'RangeIter' becomes 'range_iter'.
+
+    Also, write method now can receive an iterable of tuples, which has better
+    interoperability.
     '''
-    def __init__(self, dbfile, name=None, pool_size=5):
-        self.name = os.path.basename(dbfile) if name is None else name
-        self.db = leveldb.LevelDB(dbfile)
-        self.pool = gevent.threadpool.ThreadPool(pool_size)
+    def __init__(self, filename, *args, **kwargs):
+        '''
+        :param name: global name of this database for clients.
+        :type name: basestring or None
 
-    def async(self, fnc, *args):
-        return self.pool.apply_e(BaseException, fnc, args)
+        :param dbfile: LevelDB database path
+        :type dbfile: basestring
 
-    def get(self, key):
-        return self.async(self.db.Get, key)
+        '''
+        self.db = leveldb.LevelDB(filename, *args, **kwargs)
+        self.iterables = collections.OrderedDict()
 
-    def put(self, key, value):
-        return self.async(self.db.Put, key, value)
+    def __getattr__(self, name):
+        '''
+        Lower and underscored attribute names are reformatted, searched in
+        'db' and cached in object instance.
+        '''
+        if name.islower():
+            if "_" in name:
+                name = name.replace("_", " ").title().replace(" ", "")
+            else:
+                name = name.capitalize()
+            attr = getattr(self.db, name)
+            if name.endswith("Iter"):
+                attr = functools.partial(self.iter_wrapper, attr)
+            setattr(self, name, attr)
+            return attr
+        return object.__getattr__(self, name)
 
-    def delete(self, key):
-        return self.async(self.db.Delete, key)
+    def iter_wrapper(self, fnc, *args, **kwargs):
+        if self.iterables:
+            name = (next(reversed(self.iterables)) + 1) % sys.maxint
+        else:
+            name = 0
+        self.iterables[name] = TimedIterable(name, fnc(*args, **kwargs))
+        return name
 
-    def range(self, start=None, end=None):
-        op = self.async(self.db.RangeIter, start, end)
-        while True:
-            yield self.async(op.next)
+    def iter_next(self, name):
+        '''
+
+        '''
+        data = self.iterables[name].next()
+        self.iterables[name] = self.iterables.pop(name)
+        return data
+
+    def write(self, write_batch_list, sync=False):
+        '''
+        apply multiple put/delete operations atomatically
+        write_batch: the WriteBatch list as [("put", key, value), ("delete", key)...]
+                      holding the operations
+        '''
+        if isinstance(write_batch_list, leveldb.WriteBatch):
+            write_batch = write_batch_list
+        else:
+            write_batch = leveldb.WriteBatch()
+            for task in write_batch_list:
+                if task[0] == "put":
+                    write_batch.Put(task[1], task[2])
+                elif task[0] == "delete":
+                    write_batch.Delete(task[1])
+        return leveldb.LevelDB.Write(self, write_batch, sync)
+
+
+class ClientException(Exception):
+    pass
+
+
+class TimedIterable(object):
+    def __init__(self, name, source):
+        self.lt = time.time()
+        self.name = name
+        self.source = source
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        self.lt = time.time()
+        return self.source.next()
 
 
 class Server(object):
     '''
     Server class.
     '''
-    class SendSwitchType(object):
-        '''
-        Python switch-like for sending data..
-        '''
-        def __init__(self):
-            self.options = {
-                # Types
-                types.NoneType: self.none,
-                types.StringType: self.string,
-                types.TupleType: self.string_tuple,
-                types.GeneratorType: self.generator,
-                KeyError: self.key_error,
-                }
 
-        def __call__(self, socket, id, value):
-            self.options.get(type(value), self.default)(socket, id, value)
-
-        def key_error(self, socket, id, value):
-            socket.send_multipart((id, "\2", value.message) + value.args)
-
-        def string(self, socket, id, value):
-            socket.send_multipart((id, "\xFE", value))
-
-        def string_tuple(self, socket, id, value):
-            socket.send_multipart((id, "\xFF") + value)
-
-        def generator(self, socket, id, value):
-            for chunk in value:
-                self(socket, id, chunk)
-            socket.send_multipart((id, "\1"))
-
-        def none(self, socket, id, value):
-            socket.send_multipart((id, "\0"))
-
-        def default(self, socket, id, value):
-            if isinstance(value, BaseException):
-                # Send generic exception
-                socket.send_multipart((id, "\xFB", value.message) + value.args)
-            else:
-                logging.error("Cannot send value %r" % (value,))
-
-    send = staticmethod(SendSwitchType())
-
-    def __init__(self, listen, dbfiles):
+    def __init__(self, listen, dbfiles, timeout = 10):
         logging.info("Starting leveldb-server %s" % listen)
 
         self.context = zmq.Context()
-        self.frontend = self.context.socket(zmq.XREP)
-        self.frontend.bind(listen)
+        self.socket = self.context.socket(zmq.XREP)
+        self.socket.bind(listen)
 
-        self.poll = zmq.Poller()
-        self.poll.register(self.frontend, zmq.POLLIN)
+        self.dbs = {os.path.basename(path): Database(path) for path in dbfiles}
 
-        self.dbs = {db.name: db for db in (Database(dbfile) for dbfile in dbfiles)}
+        self.timeout = timeout
 
         logger.info("Initialized databases: %s" % ", ".join(self.dbs))
 
         self._run = False
         self._running = False
 
-    def recv(self, socket):
-        message = socket.recv_multipart()
-        id, dbname, dbop = message[:3]
-        return id, dbname, dbop, message[3:]
+    def cleaner(self):
+        while self._running:
+            t = time.time()
+            for db in self.dbs.itervalues():
+                while db.iterables:
+                    genid = next(db.iterables)
+                    if self.iterables[genid].lt > t:
+                        # TODO: Kill leveldb-iterator?
+                        del db.iterables[genid]
+                        continue
+                    break
+            gevent.sleep(1)
 
-    def task(self, socket):
-        id, dbname, dbop, args = self.recv(socket)
-        logger.debug("Received command from client: %s:%s" % (dbname, dbop))
+    def async_generator(self, iterable, identifier):
+        with gevent.Timeout(self.timeout):
+            for item in iterable:
+                socket.send_multipart((id, ord(identifier+128), msgpack.dumps(data)))
+
+    def task(self, socket, message):
+        '''
+        Respond to given message using given socket.
+        '''
         try:
-            data = getattr(self.dbs[dbname], dbop)(*args)
+            id, dbname, dbop = message[:3]
+            args, kwargs = msgpack.loads(message[3])
+            data = getattr(self.dbs[dbname], dbop)(*args, **kwargs)
+            data_type = "\2" if dbop.endswith("_iter") else "\0"
+        except ClientException as e:
+            data = (e.args[0], e.args[1:])
+            data_type = "\1"
         except BaseException as e:
-            data = e
-        self.send(socket, id, data)
+            data = (e.__class__.__name__, e.args)
+            data_type = "\1"
+        socket.send_multipart((id, data_type, msgpack.dumps(data)))
 
     def main(self):
         '''
         Server mainloop.
         '''
-        self._run = True
         self._running = True
-        while self._run:
-            for socket, type in self.poll.poll(timeout=1):
-                self.task(socket)
+        gevent.spawn(self.cleaner).start()
+        while True:
+            try:
+                message = self.socket.recv_multipart()
+                self.task(self.socket, message)
+            except zmq.ZMQError as e:
+                if err.errno == errno.EINTR:
+                    break
+                logging.exception(e)
         self._running = False
 
     def stop(self):
         '''
-        Stop mainloop
+        Send signal to current process for raising interrupting ZMQError.
         '''
-        self._run = False
+        if self._running:
+            # Signals are handled by ZMQ and throws ZMQError with errorno EINTR
+            os.kill(os.getpid(), signal.SIGTERM)
 
     def close(self):
         '''
         Stop mainloop if running and close descriptors.
         '''
         self.stop()
-        while self._running:
-            gevent.sleep()
-        self.frontend.close()
+        self.socket.close()
         self.context.term()
 
 logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
     import argparse
-    import signal
-
-    def event(event, stack):
-        server.stop()
-
-    signal.signal(signal.SIGTERM, event)
 
     parser = argparse.ArgumentParser(version=__version__, description=__app__)
     parser.add_argument("listen", metavar="tcp://127.0.0.1:5147", help="zmq listen address")

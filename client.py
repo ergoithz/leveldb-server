@@ -2,43 +2,54 @@
 # -*- coding: UTF-8 -*-
 
 import logging
+import __builtin__
+
+import msgpack
 
 logger = logging.getLogger(__name__)
 
+class TimeoutException(Exception):
+    pass
+
+class ExpiredIteratorException(Exception):
+    pass
+
 class LevelDB(object):
-    class ParserSwitchType(object):
+    class RecvSwitchType(object):
         def __init__(self):
             self.codes = {
-                "\0": self.none, # Special meaning: StopIteration
-                "\1": self.none,
-                "\2": self.key_error,
-                "\xFB": self.exception,
-                "\xFE": self.string,
-                "\xFF": self.string_tuple,
+                "\0": self.serialized,
+                "\1": self.exception,
+                "\2": self.iterable,
                 }
 
-        def __call__(self, data):
-            return self.codes.get(data[0], self.default)(data)
+        def __call__(self, socket, database):
+            data_type, data = socket.recv_multipart()
+            return self.codes.get(data_type, self.default)(socket, database, data)
 
-        def none(self, data):
-            return None
+        def serialized(self, socket, database, data):
+            return msgpack.loads(data)
 
-        def key_error(self, data):
-            raise KeyError(*data[1:])
+        def exception(self, socket, database, data):
+            exc_type, exc_args = msgpack.loads(data)
+            for scope in (globals(), __builtin__.__dict__):
+                if exc_type in scope:
+                    raise scope[exc_type](*exc_args)
+            raise Exception(*exc_args)
 
-        def exception(self, data):
-            raise Exception(*data[1:])
+        def iterable(self, socket, database, data):
+            try:
+                data = msgpack.dumps(((msgpack.loads(data),), {}))
+                while True:
+                    socket.send_multipart((database, "iter_next", data))
+                    yield self(socket, database)
+            except StopIteration:
+                pass
 
-        def string(self, data):
-            return data[1]
-
-        def string_tuple(self, data):
-            return data[1:]
-
-        def default(self, data):
+        def default(self, socket, database, data):
             logger.error("Could not parse server message %r" % data)
 
-    parse = staticmethod(ParserSwitchType())
+    recv = staticmethod(RecvSwitchType())
 
     def __init__(self, host, database, timeout=3, gevent=False):
         self.host = host
@@ -54,38 +65,22 @@ class LevelDB(object):
         self.socket = self.context.socket(zmq.XREQ)
         self.socket.connect(self.host)
 
-    def send(self, cmd, *args):
-        params = [self.database, cmd]
-        params.extend(str(i) for i in args)
-        self.socket.send_multipart(params)
+    def command(self, cmd, args, kwargs):
+        sargs = msgpack.dumps((args, kwargs))
+        self.socket.send_multipart((self.database, cmd, sargs))
+        return self.recv(self.socket, self.database)
 
-    def recv(self):
-        return self.parse(self.socket.recv_multipart())
+    def get(self, *args, **kwargs):
+        return self.command("get", args, kwargs)
 
-    def recv_multi(self):
-        data = self.socket.recv_multipart()
-        while data[0] != "\1":
-            yield self.parse(data)
-            data = self.socket.recv_multipart()
+    def put(self, *args, **kwargs):
+        return self.command("put", args, kwargs)
 
-    def get(self, key):
-        self.send("get", key)
-        return self.recv()
+    def delete(self, *args, **kwargs):
+        return self.command("delete", args, kwargs)
 
-    def put(self, key, value):
-        self.send("put", key, value)
-        return self.recv()
-
-    def delete(self, key):
-        self.send("delete", key)
-        return self.recv()
-
-    def range(self, start=None, end=None):
-        """
-        Range return key/value items
-        """
-        self.send("range", start, end)
-        return self.recv_multi()
+    def range_iter(self, *args, **kwargs):
+        return self.command("range_iter", args, kwargs)
 
     def close(self):
         self.socket.close()

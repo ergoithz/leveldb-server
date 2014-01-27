@@ -1,5 +1,6 @@
 
+msgpack-python
+ez_setup # Fixes pyzmq ez-setup dependency
 gevent
 pyzmq
 leveldb
-ez-setup
