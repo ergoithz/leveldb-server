@@ -6,6 +6,8 @@ import signal
 import unittest
 import sys
 import os
+import tempfile
+import shutil
 
 import gevent
 import gevent.subprocess as subprocess
@@ -13,20 +15,21 @@ import gevent.subprocess as subprocess
 import server
 import client
 
-import old_server
-import old_client
-
 class TestLevelDB(unittest.TestCase):
     def setUp(self):
         port = 5147
+        os.system("fuser -k -n tcp %d" % port)
         address = "tcp://127.0.0.1:%d" % port
-        dbname = "test.db"
-        self.popen = subprocess.Popen((sys.executable, server.__file__, "--verbose", address, dbname))
-        self.db = client.LevelDB(address, dbname)
+        self.tmpdb = tempfile.mkdtemp()
+        self.popen = subprocess.Popen(
+            (sys.executable, "-u", server.__file__, "--verbose", address, "--create-if-missing", self.tmpdb)
+            )
+        self.db = client.LevelDB(address, os.path.basename(self.tmpdb), green=True)
 
     def tearDown(self):
         self.popen.send_signal(signal.SIGTERM)
         self.popen.wait()
+        shutil.rmtree(self.tmpdb)
 
     def test_put_and_get(self):
         self.db.put("test", "value")
@@ -40,7 +43,7 @@ class TestLevelDB(unittest.TestCase):
         self.assertRaises(KeyError, self.db.get, "test")
 
     def test_range(self):
-        data_range = [("key-%s" % i, str(i)) for i in range(10)]
+        data_range = [("key-%05d" % i, str(i)) for i in range(1000)]
 
         # put everything into database
         for key, value in data_range:
@@ -48,8 +51,8 @@ class TestLevelDB(unittest.TestCase):
 
         # iterate through results and compare
         data = itertools.izip(
-            self.db.range_iter(data_range[5][0], data_range[-1][0]),
-            data_range[5:]
+            self.db.iterator(data_range[500][0]+"\0", data_range[-1][0]+"\0"),
+            data_range[500:]
             )
         for (k1, v1), (k2, v2) in data:
             self.assertEqual(k1, k2)
@@ -57,18 +60,19 @@ class TestLevelDB(unittest.TestCase):
 
 
 def benchmark():
-
     import timeit
     port = 5147
-    os.system("fuser -k -n tcp %d" % port)
+
     address = "tcp://127.0.0.1:%d" % port
-    dbname = "test.db"
+    tmpdb = tempfile.mkdtemp()
+    dbname = os.path.basename(tmpdb)
+    elements = 10000
 
     print "Current implementation"
-    popen = subprocess.Popen((sys.executable, server.__file__, address, dbname))
+    popen = subprocess.Popen((sys.executable, server.__file__, address, tmpdb))
     gevent.sleep(1) # Wait for server
-    db = client.LevelDB(address, dbname)
-    elements = 100000
+    db = client.LevelDB(address, dbname, green=True)
+
     print "    Initialize %d 'put' greenlets..." % elements
     greenlets = [
         gevent.spawn(db.put, "key-%d" % i, "value-%d" % i)
@@ -76,16 +80,24 @@ def benchmark():
         ]
     print "    Joining..."
     print "    %f" % timeit.timeit(lambda: gevent.joinall(greenlets), number=1)
-
+    print "    Initialize %d 'get' greenlets..." % elements
+    greenlets = [
+        gevent.spawn(db.get, "key-%d" % i)
+        for i in xrange(elements)
+        ]
+    print "    Joining..."
+    print "    %f" % timeit.timeit(lambda: gevent.joinall(greenlets), number=1)
     popen.send_signal(signal.SIGTERM)
     popen.wait()
+    shutil.rmtree(tmpdb)
+
+    import old_server
+    import old_client
 
     print "Old implementation"
-    os.system("fuser -k -n tcp %d" % port)
-    popen = subprocess.Popen((sys.executable, old_server.__file__, "-l", address, "--dbfiles=%s" % dbname))
+    popen = subprocess.Popen((sys.executable, old_server.__file__, "-l", address, "--dbfiles=%s" % tmpdb))
     gevent.sleep(1)
     db = old_client.leveldb(dbname, address)
-    elements = 100000
     print "    Initialize %d 'put' greenlets..." % elements
     greenlets = [
         gevent.spawn(db.put, "key-%d" % i, "value-%d" % i)
@@ -93,10 +105,19 @@ def benchmark():
         ]
     print "    Joining..."
     print "    %f" % timeit.timeit(lambda: gevent.joinall(greenlets), number=1)
-
+    '''
+    # DISABLED: OLD IMPLEMENTATION FAILS
+    print "    Initialize %d 'get' greenlets..." % elements
+    greenlets = [
+        gevent.spawn(db.get, "key-%d" % i)
+        for i in xrange(elements)
+        ]
+    print "    Joining..."
+    print "    %f" % timeit.timeit(lambda: gevent.joinall(greenlets), number=1)
+    '''
     popen.send_signal(signal.SIGTERM)
     popen.wait()
-
+    shutil.rmtree(tmpdb)
 
 if __name__ == '__main__':
     unittest.main()
