@@ -45,8 +45,15 @@ class CommandProtocol(object):
         self.codes = {
             "\0": self.serialized,
             "\1": self.exception,
-            "\2": self.iterable,
+            "\2": self.remote_object,
             }
+
+        self.remote_types = {
+            "Iterator": RemoteIterable,
+            "RawIterator": RemoteIterable,
+            }
+
+        self.remote_type = RemoteObject
 
     @staticmethod
     def _socket(context, type, host):
@@ -109,19 +116,19 @@ class CommandProtocol(object):
                 raise scope[exc_type](*exc_args)
         raise Exception(*exc_args)
 
-    def iterable(self, data, database, op, args, kwargs):
+    def remote_object(self, data, op, args, kwargs):
         '''
         Yield server results, asynchronously from server.
 
         :param zmq.Socket socket: socket will be used for subsequent requests
-        :param basestring data: serialized iter_id send by server
+        :param basestring data: serialized (rotype, roid) tuple send by server
         :param basestring database: database name
         :param basestring op: unused
         :param tuple args: unused
         :param dict kwargs: operation keyword arguments, bulksize key is used
         '''
-        iter_id = msgpack.loads(data)
-        return RemoteIterable(iter_id, self, kwargs.get("bulksize", 1))
+        rotype, roid = msgpack.loads(data)
+        return self.remote_types.get(rotype, self.remote_type)(rotype, roid, self, op, args, kwargs)
 
     def default(self, data, *_):
         '''
@@ -135,32 +142,39 @@ class CommandProtocol(object):
         logger.error("Could not parse server message %r" % data)
 
 
-class RemoteIterable(object):
-    def __init__(self, iter_id, protocol, bulksize=1):
-        self.iter_id = iter_id
+class RemoteObject(object):
+    def __init__(self, rotype, roid, protocol, op, args, kwargs):
+        self.rotype = rotype
+        self.roid = roid
         self.protocol = protocol
-        slef.bulksize = bulksize
-        self.cache = collections.deque()
-        self.exhausted = False
 
-    def retrieve(self):
-        if self.exhausted:
-            raise StopIteration
-        data = self.protocol.command("iter_next", (self.iter_id, self.bulksize))
-        self.cache.extend(data)
-        self.exhausted = len(data) < self.bulksize
+    def __del__(self):
+        self.close()
+
+    def close(self):
+        self.protocol.command("ro_close", (self.roid,), {"sync": False})
+
+
+class RemoteIterable(RemoteObject):
+    def __init__(self, rotype, roid, protocol, op, args, kwargs):
+        RemoteObject.__init__(self, rotype, roid, protocol, op, args, kwargs)
+        self.bulksize = kwargs.get("bulksize", 10)
+        self._cache = collections.deque()
+        self._exhausted = False
 
     def __iter__(self):
         return self
 
     def next(self):
-        if not self.cache:
-            self.retrieve()
-        return self.cache.popleft()
-
-    def close(self):
-        self.pool.close()
-        self.context.term()
+        if not self._cache:
+            if self._exhausted:
+                raise StopIteration
+            data = self.protocol.command("ro_next", (self.roid, self.bulksize))
+            if not data:
+                raise StopIteration
+            self._cache.extend(data)
+            self._exhausted = len(data) < self.bulksize
+        return self._cache.popleft()
 
 
 class LevelDB(object):
@@ -196,7 +210,7 @@ class LevelDB(object):
     def iterator(self, *args, **kwargs):
         kwargs.setdefault("bulksize", self.bulksize)
         # TODO: choose between iterator and raw_iterator
-        return self.command("raw_iterator", args, kwargs)
+        return self.command("iterator", args, kwargs)
 
     def put(self, *args, **kwargs):
         kwargs.setdefault("sync", False)

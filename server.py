@@ -39,7 +39,13 @@ class Database(object):
     Also, write method now can receive an iterable of tuples, which has better
     interoperability.
     '''
-    IteratorTypes = (plyvel._plyvel.Iterator, plyvel._plyvel.RawIterator)
+    RemoteObjectTypes = (
+        plyvel._plyvel.Iterator,
+        plyvel._plyvel.RawIterator,
+        plyvel._plyvel.PrefixedDB,
+        plyvel._plyvel.WriteBatch,
+        plyvel._plyvel.Snapshot,
+        )
     db_methods = {
         # plyvel.DB method signatures {method: (args tuple..., kwargs tuple...))}
         "get_property": (("name",),()),
@@ -56,7 +62,7 @@ class Database(object):
         "approximate_sizes": (None, ()),
         "delete": (("key",), ("sync",)),
     }
-
+    optional_kwargs = {"sync", "bulksize"}
 
     def __init__(self, name, create_if_missing=False, error_if_exists=False,
         paranoid_checks=None, write_buffer_size=None, max_open_files=None,
@@ -89,47 +95,110 @@ class Database(object):
             "prefixed_db": "Not implemented by server.",
             "write_batch": "Not implemented by server, use 'write' instead.",
             }
-        self.iterables = {}
-        self.iterables_lt = collections.OrderedDict()
+        self.remote_objects = {}
+        self.remote_objects_lt = collections.OrderedDict()
 
-    def iter_wrapper(self, iterator, client_id):
+    def ro_expire(self, roid=None, lt=0):
+        if roid is None:
+            success = False
+            while self.remote_objects_lt:
+                roid = self.remote_objects_lt.iterkeys().next()
+                if not self.ro_expire(roid, lt):
+                    break
+                success |= True
+            return success
+        if self.remote_objects_lt[roid] < lt:
+            self.ro_close(roid)
+            return True
+        return False
+
+    def ro_close(self, roid):
+        remote_object = db.remote_objects.pop(roid)
+        del db.remote_objects_lt[roid]
+        if hasattr(remote_object, "close"):
+            remote_object.close()
+
+    def ro_wrapper(self, remote_object, client_id):
         '''
         Call given function with given args kwargs, creates an AsyncIterable
         and store it and returns iterable name. See :py:method:Database.iter_next
         '''
-        clientid = kwargs.pop("clientid", 1)
         # ClientID is attached to iter name to avoid other client taking apart
         # on extremely busy servers.
-        if self.iterables:
-            last_numid, last_client = next(reversed(self.iterables)).split(".")
+        if self.remote_objects:
+            last_numid, last_client = next(reversed(self.remote_objects)).split(".")
             numid = (int(last_numid) + 1) % 4294967295 # max uint is 2**32-1
         else:
             numid = 0
-        iter_id = "%d.%s" % (numid, client_id)
-        self.iterables[iter_id] = iterator
-        self.iterables_lt[iter_id] = time.time()
-        return iter_id
+        roid = "%d.%s" % (numid, client_id)
+        self.remote_objects[roid] = remote_object
+        self.remote_objects_lt[roid] = time.time()
+        return remote_object.__class__.__name__, roid
 
-    def iter_next(self, iter_id, method, howmany):
-        del self.iterables_lt[iter_id]
-        data = list(itertools.islice(self.iterables[iter_id], howmany))
+    def ro_next(self, roid, howmany):
+        del self.remote_objects_lt[roid]
+        data = list(itertools.islice(self.remote_objects[roid], howmany))
         if len(data) < howmany:
-            self.iterables.pop(iter_id).close()
+            self.remote_objects.pop(roid).close()
         else:
-            self.iterables_lt[iter_id] = time.time()
+            self.remote_objects_lt[roid] = time.time()
         return data
 
-    def iter_method(self, iter_id, method, *args, **kwargs):
+    def ro_method(self, roid, method, *args, **kwargs):
         '''
 
         '''
-        del self.iterables_lt[iter_id]
+        del self.remote_objects_lt[roid]
         if method == "close":
-            data = self.iterables.pop(iter_id).close()
+            data = self.remote_objects.pop(roid).close()
         else:
-            data = getattr(self.iterables[iter_id], method)(*args, **kwargs)
-            self.iterables_lt[iter_id] = time.time()
+            data = getattr(self.remote_objects[roid], method)(*args, **kwargs)
+            self.remote_objects_lt[roid] = time.time()
         return data
+
+    def fix_arguments(self, op, args, kwargs):
+        '''
+        Plyvel does not allow to pass positional arguments as keyword arguments
+        (which is the expected python behavior), this method aims to fix this,
+        and allow to pass keyword arguments as positional ones too.
+        '''
+        proto_args, proto_kwargs = self.db_methods[op]
+        if proto_args is None:
+            # If proto_args is None method has a positional wildcard
+            given_args = args
+            given_kwargs = kwargs
+        elif len(args) > len(proto_args):
+            pnargs = len(proto_args)
+            # Move args to kwargs
+            given_args = args[:pnargs]
+            given_kwargs = dict(itertools.izip(proto_kwargs, args[pnargs:]))
+             # Avoid duplicates in proto_kwargs corresponding to extra args
+            for keyword in given_kwargs:
+                if keyword in kwargs:
+                    raise TypeError(
+                        "%s() got multiple values for keyword argument %r"
+                            % (op, keyword))
+            # Add kwargs
+            given_kwargs.update(kwargs)
+        else:
+            # Move kwargs to args
+            gnargs = len(args)
+            given_args = list(args)
+            given_kwargs = dict(kwargs)
+            try:
+                given_args.extend(given_kwargs.pop(k) for k in proto_args[gnargs:])
+            except KeyError:
+                pnargs = len(proto_args)
+                raise TypeError(
+                    "%s() takes at least %d argument%s (%d given)"
+                        % (op, pnargs, "s" if pnargs > 1 else "", gnargs))
+
+        # Discard optional kwargs not accepted by method
+        for k in self.optional_kwargs:
+            if k in given_kwargs and not k in proto_kwargs:
+                del given_kwargs[k]
+
+        return given_args, given_kwargs
 
     def command(self, op, *args, **kwargs):
         if op in self.not_implemented:
@@ -138,23 +207,7 @@ class Database(object):
             return getattr(self, op)(*args, **kwargs)
         elif op in self.db_methods:
             # Fix methods arguments and keyword arguments by position
-            proto_args, proto_kwargs = self.db_methods[op]
-            if proto_args is None:
-                given_args = args
-                given_kwargs = {}
-            elif len(args) > len(proto_args):
-                # Move args to kwargs by position
-                nargs = len(proto_args)
-                given_args = args[:nargs]
-                given_kwargs = dict(itertools.izip(proto_kwargs, args[nargs:]))
-            else:
-                # Move kwargs to args by position
-                nargs = len(args)
-                given_args = list(args)
-                given_args.extend(kwargs[k] for k in proto_args[len(args):])
-                given_kwargs = {k:v for k,v in kwargs.iteritems() if not k in proto_args}
-            args = given_args
-            kwargs = given_kwargs
+            args, kwargs = self.fix_arguments(op, args, kwargs)
         return getattr(self.db, op)(*args, **kwargs)
 
     def write(self, write_batch_list, transaction=False, sync=False):
@@ -204,13 +257,7 @@ class Server(object):
         while self._running:
             expiration = time.time() - self.timeout
             for db in self.dbs.itervalues():
-                while db.iterables_lt:
-                    numid, lt = db.iterables_lt.iteritems().next()
-                    if lt < expiration:
-                        db.iterables.pop(numid).close()
-                        del db.iterables_lt[numid]
-                        continue
-                    break
+                db.ro_expire(lt=expiration)
             gevent.sleep(self.timeout)
 
     def task(self, socket, message):
@@ -223,8 +270,8 @@ class Server(object):
         try:
             data = self.dbs[dbname].command(dbop, *args, **kwargs)
             data_type = "\0"
-            if isinstance(data, Database.IteratorTypes):
-                data = self.dbs[dbname].iter_wrapper(data)
+            if isinstance(data, Database.RemoteObjectTypes):
+                data = self.dbs[dbname].ro_wrapper(data, id)
                 data_type = "\2"
         except ClientException as e:
             data = (e.args[0], e.args[1:])

@@ -32,17 +32,17 @@ class TestLevelDB(unittest.TestCase):
         shutil.rmtree(self.tmpdb)
 
     def test_put_and_get(self):
-        self.db.put("test", "value")
+        self.db.put("test", "value", sync=True)
         self.assertEqual("value", self.db.get("test"))
 
     def test_delete(self):
-        self.db.put("test", "value")
+        self.db.put("test", "value", sync=True)
         self.assertEqual("value", self.db.get("test"))
 
-        self.db.delete("test")
+        self.db.delete("test", sync=True)
         self.assertRaises(KeyError, self.db.get, "test")
 
-    def test_range(self):
+    def test_iterator(self):
         data_range = [("key-%05d" % i, str(i)) for i in range(1000)]
 
         # put everything into database
@@ -51,7 +51,7 @@ class TestLevelDB(unittest.TestCase):
 
         # iterate through results and compare
         data = itertools.izip(
-            self.db.iterator(data_range[500][0]+"\0", data_range[-1][0]+"\0"),
+            self.db.iterator(False, data_range[500][0], data_range[-1][0], include_start=True),
             data_range[500:]
             )
         for (k1, v1), (k2, v2) in data:
