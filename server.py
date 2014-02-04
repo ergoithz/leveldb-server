@@ -135,14 +135,12 @@ class Database(object):
         self.remote_objects_lt[roid] = time.time()
         return remote_object.__class__.__name__, roid
 
-    def ro_next(self, roid, howmany):
-        del self.remote_objects_lt[roid]
-        data = list(itertools.islice(self.remote_objects[roid], howmany))
-        if len(data) < howmany:
-            self.remote_objects.pop(roid).close()
-        else:
-            self.remote_objects_lt[roid] = time.time()
-        return data
+    def ro_next(self, roid, howmany, reverse=False):
+        self.remote_objects_lt[roid] = self.remote_objects_lt.pop(roid)
+        iterable = self.remote_objects[roid]
+        if reverse:
+            iterable = self._iter_prev(iterable)
+        return list(itertools.islice(iterable, howmany))
 
     def ro_method(self, roid, method, *args, **kwargs):
         '''
@@ -156,13 +154,22 @@ class Database(object):
             self.remote_objects_lt[roid] = time.time()
         return data
 
-    def fix_arguments(self, op, args, kwargs):
+    @classmethod
+    def _iter_prev(cls, iterable):
+        try:
+            while True:
+                yield iterable.prev()
+        except StopIteration:
+            pass
+
+    @classmethod
+    def _fix_arguments(cls, op, args, kwargs):
         '''
         Plyvel does not allow to pass positional arguments as keyword arguments
         (which is the expected python behavior), this method aims to fix this,
         and allow to pass keyword arguments as positional ones too.
         '''
-        proto_args, proto_kwargs = self.db_methods[op]
+        proto_args, proto_kwargs = cls.db_methods[op]
         if proto_args is None:
             # If proto_args is None method has a positional wildcard
             given_args = args
@@ -194,7 +201,7 @@ class Database(object):
                         % (op, pnargs, "s" if pnargs > 1 else "", gnargs))
 
         # Discard optional kwargs not accepted by method
-        for k in self.optional_kwargs:
+        for k in cls.optional_kwargs:
             if k in given_kwargs and not k in proto_kwargs:
                 del given_kwargs[k]
 
@@ -207,18 +214,8 @@ class Database(object):
             return getattr(self, op)(*args, **kwargs)
         elif op in self.db_methods:
             # Fix methods arguments and keyword arguments by position
-            args, kwargs = self.fix_arguments(op, args, kwargs)
+            args, kwargs = self._fix_arguments(op, args, kwargs)
         return getattr(self.db, op)(*args, **kwargs)
-
-    def write(self, write_batch_list, transaction=False, sync=False):
-        '''
-        apply multiple put/delete operations atomatically
-        write_batch: the WriteBatch list as [("put", key, value), ("delete", key)...]
-                      holding the operations
-        '''
-        with plyvel.DB.write_batch(self, transaction, sync) as w:
-            for task in write_batch_list:
-                getattr(w, task[0])(*task[1:])
 
 
 class ClientException(Exception):

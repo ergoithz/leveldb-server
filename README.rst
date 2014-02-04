@@ -1,8 +1,8 @@
 leveldb-server
 =============
 
-* Async leveldb server and client based on zeromq
-* Storage engine *leveldb*. http://code.google.com/p/leveldb/
+* Async leveldb server and client
+* Storage engine *leveldb* with *plyvel*. https://github.com/wbolster/plyvel
 * Networking library *zeromq*. http://www.zeromq.org/
 * Server based on *gevent* for massive concurrency. http://www.gevent.org/
 * Client compatible with gevent.
@@ -16,30 +16,17 @@ Feature
 =============
 
 * Very simple key-value storage
-* Data is sorted by key - allows @range@ queries
-* Data is automatically compressed 
-* Can act as persistent cache
-* Simple backups @cp -rf level.db backup.db@ 
-* Networking/wiring from @zeromq@ messaging library - allows many topologies
-* Async server for scalability and capacity
-* Sync client for easy coding
+* Data is sorted by key allowing iteration
+* Data could be automatically compressed
+* Can be run as persistent cache
+* Simple backups (copying a directory)
+* Networking/wiring from **zeromq** messaging library
+* Async gevent-compatible client.
 * Easy polyglot client bindings. See *"zmq bindings":http://www.zeromq.org/bindings:_start*
 
-::
+.. TODO: Code example once API were stabilized
 
-    db.put("k3", "v3")
-    db.get("k3")
-    # "v3"
-    db.range()
-    # generator
-    list(db.range())
-    # '[["k1", "v1"], ["k2", "v2"], ["k3", "v3"]]'
-    list(db.range("k1", "k2"))
-    # '[["k1", "v1"], ["k2", "v2"]]'
-    db.delete('k1')
-
-
-Will be adding high availability, replication and autosharding using the same zeromq framework. 
+Will be adding high availability, replication and autosharding using the same zeromq framework.
 
 Dependencies
 -------------
@@ -47,7 +34,7 @@ Dependencies
 
 * gevent
 * pyzmq
-* leveldb
+* plyvel
 
 Getting Started
 =============
@@ -55,9 +42,20 @@ Getting Started
 I highly recommends 'virtualenv'. Virtualenv is an script for easy dependency installation and should be used for any
 serious project for easing deployment and dependency isolation.
 
-# Install dependencies
+Install dependencies
+-------------
+
+1. First you need LevelDB binary and development libraries
+    For example, in ubuntu (12.10 or later) just run
 ::
 
+    sudo apt-get install libleveldb1 libleveldb-dev
+
+2. Then create a virtuaenv and proccess the requirements file *requirements.txt* included in this project.
+::
+
+    virtualenv env
+    . env/bin/activate
     pip install -r requirements.txt
 
 Using the "leveldb-client-py":https://github.com/ergoithz/leveldb-server/blob/master/client.py
@@ -66,11 +64,9 @@ Using the "leveldb-client-py":https://github.com/ergoithz/leveldb-server/blob/ma
 ::
 
     from leveldb_server import client
-    db = client.LevelDB()
+    db = client.Connection("tcp://localhost:9010", "testdb")
     db.get("Key")
     db.put("K", "V")
-    db.range()
-    db.range(start, end)
     db.delete("K")
 
 Backups
@@ -79,22 +75,26 @@ Backups
 LevelDB stores database into a single file.
 ::
 
-    cp -rpf level.db backup.db
+    cp -rpf /path/to/database /path/to/database_backup
 
 Known issues and work in progress
 =============
 
-Would love your pull requests on
+I'm currently working on (by priority order)
+* Stabilize api and code
+* Async server connection handling, although leveldb does not allow true parallelization.
 * Benchmarking and performance analysis
-* client libraries for other languages
-* [issue] zeromq performance issues with 1M+ inserts at a time
-* [feature] timeouts in client library
-* [feature] support for counters
-* [feature] limit support in range queries
-* Serializing and seperate threads for get/put/range in leveldb-server
-* HA/replication/autosharding and possibly pub-sub for replication
+* Client timeout
+* Autosharding/replication built on top of ZeroMQ
+* Client libraries for other languages (maybe Haxe)
 
 Thanks
 =============
 
-Thanks to all the folks who have contributed to all the dependencies. Special thanks to pyzmq/examples/mongo* author for inspiration. 
+The original guys started and abandoned leveldb-server project, leaving some non-working code on github which inspired me to start this project.
+
+'Wouter Bolsterlee __, which created the first production-ready LevelDB python wrapper: **plyvel**
+
+.. _wbolster: https://github.com/wbolster
+
+__ wbolster_

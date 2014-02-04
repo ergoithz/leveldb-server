@@ -15,7 +15,7 @@ import gevent.subprocess as subprocess
 import server
 import client
 
-class TestLevelDB(unittest.TestCase):
+class TestClient(unittest.TestCase):
     def setUp(self):
         port = 5147
         os.system("fuser -k -n tcp %d" % port)
@@ -24,7 +24,7 @@ class TestLevelDB(unittest.TestCase):
         self.popen = subprocess.Popen(
             (sys.executable, "-u", server.__file__, "--verbose", address, "--create-if-missing", self.tmpdb)
             )
-        self.db = client.LevelDB(address, os.path.basename(self.tmpdb), green=True)
+        self.db = client.Connection(address, os.path.basename(self.tmpdb), green=True)
 
     def tearDown(self):
         self.popen.send_signal(signal.SIGTERM)
@@ -40,19 +40,19 @@ class TestLevelDB(unittest.TestCase):
         self.assertEqual("value", self.db.get("test"))
 
         self.db.delete("test", sync=True)
-        self.assertRaises(KeyError, self.db.get, "test")
+        self.assertEqual(None, self.db.get("test"))
 
     def test_iterator(self):
-        data_range = [("key-%05d" % i, str(i)) for i in range(1000)]
+        data_range = [("key-%05d" % i, str(i)) for i in range(25)]
 
         # put everything into database
         for key, value in data_range:
-            self.db.put(key, value)
+            self.db.put(key, value, sync=True)
 
         # iterate through results and compare
         data = itertools.izip(
-            self.db.iterator(False, data_range[500][0], data_range[-1][0], include_start=True),
-            data_range[500:]
+            self.db.iterator(False, data_range[-5][0], data_range[-1][0]),
+            data_range[-5:]
             )
         for (k1, v1), (k2, v2) in data:
             self.assertEqual(k1, k2)
