@@ -81,20 +81,19 @@ Known issues and work in progress
 =============
 
 I'm currently working on (by priority order)
-* Stabilize api and code
-* Async server connection handling, although leveldb does not allow true parallelization.
-* Benchmarking and performance analysis
-* Client timeout
-* Autosharding/replication built on top of ZeroMQ
-* Client libraries for other languages (maybe Haxe)
+ * Stabilize api and code
+ * Async server connection handling, although leveldb does not allow true parallelization.
+ * Benchmarking and performance analysis
+ * Client timeout
+ * Autosharding/replication built on top of ZeroMQ
+ * Client libraries for other languages (maybe Haxe)
 
 Thanks
 =============
 
 The original guys started and abandoned leveldb-server project, leaving some non-working code on github which inspired me to start this project.
 
-'Wouter Bolsterlee __, which created the first production-ready LevelDB python wrapper: **plyvel**
+`Wouter Bolsterlee`_, which created the first production-ready LevelDB python wrapper: **plyvel**
 
-.. _wbolster: https://github.com/wbolster
+.. _Wouter Bolsterlee: https://github.com/wbolster
 
-__ wbolster_
