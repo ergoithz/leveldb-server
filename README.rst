@@ -58,8 +58,10 @@ Install dependencies
     . env/bin/activate
     pip install -r requirements.txt
 
-Using the "leveldb-client-py":https://github.com/ergoithz/leveldb-server/blob/master/client.py
+Using the `client library`_
 -------------
+
+.. _client library: https://github.com/ergoithz/leveldb-server/blob/master/client.py
 
 ::
 
