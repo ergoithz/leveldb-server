@@ -1,6 +1,6 @@
 
 msgpack-python
-flyvel # requires libleveldb1 and libleveldb-dev
+plyvel # requires libleveldb1 and libleveldb-dev
 ez_setup # fixes pyzmq ez-setup dependency
 gevent
 pyzmq

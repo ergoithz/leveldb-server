@@ -5,6 +5,9 @@ leveldb-server
 .. image:: https://travis-ci.org/ergoithz/leveldb-server.png?branch=master
   :target: https://travis-ci.org/ergoithz/leveldb-server
 
+.. image:: https://coveralls.io/repos/ergoithz/leveldb-server/badge.png
+  :target: https://coveralls.io/r/ergoithz/leveldb-server
+
 * Async leveldb server and client
 * Storage engine *leveldb* with *plyvel*. https://github.com/wbolster/plyvel
 * Networking library *zeromq*. http://www.zeromq.org/
