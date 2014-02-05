@@ -4,11 +4,16 @@ python:
 env:
   - LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$TRAVIS_BUILD_DIR/leveldb-1.15.0
 before_install:
-  - wget -O leveldb.tgz https://leveldb.googlecode.com/files/leveldb-1.15.0.tar.gz
-  - tar -xf leveldb.tgz
-  - cd leveldb-1.15.0
-  - make
-  - cd ..
+  - wget http://de.archive.ubuntu.com/ubuntu/pool/main/l/leveldb/libleveldb1_1.9.0-1_amd64.deb
+  - wget http://de.archive.ubuntu.com/ubuntu/pool/main/l/leveldb/libleveldb-dev_1.9.0-1_amd64.deb
+  - wget http://de.archive.ubuntu.com/ubuntu/pool/main/s/snappy/libsnappy1_1.0.5-2_amd64.deb
+  - wget http://de.archive.ubuntu.com/ubuntu/pool/main/s/snappy/libsnappy-dev_1.0.5-2_amd64.deb
+  - sudo dpkg -i libleveldb1_1.9.0-1_amd64.deb
+  - sudo dpkg -i libleveldb-dev_1.9.0-1_amd64.deb
+  - sudo dpkg -i libsnappy1_1.0.5-2_amd64.deb
+  - sudo dpkg -i libsnappy-dev_1.0.5-2_amd64.deb
 install:
   - pip install -r requirements.txt
 script: test.py
+after_success:
+  - coveralls
