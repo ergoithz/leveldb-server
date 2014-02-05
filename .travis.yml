@@ -8,5 +8,7 @@ before_install:
   - tar -xf leveldb.tgz
   - cd leveldb-1.15.0
   - make
+  - cd ..
+install:
   - pip install -r requirements.txt
 script: test.py
