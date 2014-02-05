@@ -2,13 +2,14 @@
 leveldb-server
 =============
 
-.. image:: https://travis-ci.org/ergoithz/leveldb-server.png?branch=master   :target: https://travis-ci.org/ergoithz/leveldb-server
+.. image:: https://travis-ci.org/ergoithz/leveldb-server.png?branch=master
+  :target: https://travis-ci.org/ergoithz/leveldb-server
 
- * Async leveldb server and client
- * Storage engine *leveldb* with *plyvel*. https://github.com/wbolster/plyvel
- * Networking library *zeromq*. http://www.zeromq.org/
- * Server based on *gevent* for massive concurrency. http://www.gevent.org/
- * Client compatible with gevent.
+* Async leveldb server and client
+* Storage engine *leveldb* with *plyvel*. https://github.com/wbolster/plyvel
+* Networking library *zeromq*. http://www.zeromq.org/
+* Server based on *gevent* for massive concurrency. http://www.gevent.org/
+* Client compatible with gevent.
 
 License
 -------------
@@ -18,14 +19,14 @@ New BSD license. Please see license.txt for more details.
 Feature
 =============
 
- * Very simple key-value storage
- * Data is sorted by key allowing iteration
- * Data could be automatically compressed
- * Can be run as persistent cache
- * Simple backups (copying a directory)
- * Networking/wiring from **zeromq** messaging library
- * Async gevent-compatible client.
- * Easy polyglot client bindings. See `zmq bindings`_
+* Very simple key-value storage
+* Data is sorted by key allowing iteration
+* Data could be automatically compressed
+* Can be run as persistent cache
+* Simple backups (copying a directory)
+* Networking/wiring from **zeromq** messaging library
+* Async gevent-compatible client.
+* Easy polyglot client bindings. See `zmq bindings`_
 
 .. _zmq bindings: http://www.zeromq.org/bindings:_start
 
@@ -46,9 +47,9 @@ Dependencies
 -------------
 (see requirements.txt)
 
- * gevent
- * pyzmq
- * plyvel
+* gevent
+* pyzmq
+* plyvel
 
 Getting Started
 =============
@@ -102,12 +103,12 @@ Known issues and work in progress
 
 I'm currently working on (by priority order)
 
- * Stabilize api and code
- * Async server connection handling, although leveldb does not allow true parallelization.
- * Benchmarking and performance analysis
- * Client timeout
- * Autosharding/replication built on top of ZeroMQ
- * Client libraries for other languages (maybe Haxe)
+* Stabilize api and code
+* Async server connection handling, although leveldb does not allow true parallelization.
+* Benchmarking and performance analysis
+* Client timeout
+* Autosharding/replication built on top of ZeroMQ
+* Client libraries for other languages (maybe Haxe)
 
 Thanks
 =============
