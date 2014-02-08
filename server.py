@@ -62,7 +62,7 @@ class Database(object):
         "approximate_sizes": (None, ()),
         "delete": (("key",), ("sync",)),
     }
-    optional_kwargs = {"sync", "bulksize"}
+    optional_kwargs = {"sync", "wait", "bulksize"}
 
     def __init__(self, name, create_if_missing=False, error_if_exists=False,
         paranoid_checks=None, write_buffer_size=None, max_open_files=None,
@@ -230,6 +230,7 @@ class Server(object):
         '''
 
         '''
+        self.workers = 10
         self.timeout = timeout
         self.context = zmq.Context()
         self.context.setsockopt(zmq.RCVTIMEO, (self.timeout*1000))
@@ -237,6 +238,9 @@ class Server(object):
 
         self.socket = self.context.socket(zmq.ROUTER)
         self.socket.bind(listen)
+
+        self.backend = self.context.socket(zmq.DEALER)
+        self.backend.bind('inproc://backend')
 
         logger.info("Listening at %s" % listen)
 
@@ -276,26 +280,49 @@ class Server(object):
         except BaseException as e:
             data = (e.__class__.__name__, e.args)
             data_type = "\1"
-        if kwargs.get("sync", True):
+        if kwargs.get("wait", True):
             socket.send_multipart((id, data_type, msgpack.dumps(data)))
 
-    def main(self):
+    def worker(self):
         '''
-        Server mainloop.
+        Server worker
         '''
-        self._running = True
-        self._run = True
-        gevent.spawn(self.cleaner).start()
-        while self._run:
+        socket = self.context.socket(zmq.DEALER)
+        socket.connect('inproc://backend')
+        while self._running:
             try:
-                message = self.socket.recv_multipart()
-                self.task(self.socket, message)
+                message = socket.recv_multipart()
+                self.task(socket, message)
             except zmq.ZMQError as e:
                 if err.errno == errno.EINTR:
                     break
                 logger.exception(e)
             except BaseException as e:
                 logger.exception(e)
+
+    def proxy(self, in_socket, out_socket):
+        while self._running:
+            out_socket.send_multipart(in_socket.recv_multipart())
+
+    def main(self):
+        self._running = True
+        self._run = True
+
+        # Garbage collector
+        gevent.spawn(self.cleaner)
+
+        # Proxies
+        gevent.spawn(self.proxy, self.socket, self.backend)
+        gevent.spawn(self.proxy, self.backend, self.socket)
+
+        # Workers
+        for i in xrange(self.workers):
+            gevent.spawn(self.worker)
+
+        # Mainloop
+        while self._run:
+            gevent.sleep(1)
+
         self._running = False
 
     def stop(self):

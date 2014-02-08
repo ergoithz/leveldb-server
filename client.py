@@ -139,7 +139,7 @@ class CommandProtocol(object):
         try:
             sargs = msgpack.dumps((args, kwargs))
             socket.send_multipart((self.database, op, sargs))
-            if kwargs.get("sync", True):
+            if kwargs.get("wait", True):
                 data_type, data = socket.recv_multipart()
                 return self.codes.get(data_type, self.default)(data, (self, op, args, kwargs))
         finally:
@@ -207,6 +207,13 @@ class RemoteObject(object):
         self.protocol, self._op, self._args, self._kwargs = command
 
     def command(self, op, args=(), kwargs={}):
+        '''
+        Run command on server for this remote object
+
+        :param basestring op: operation
+        :param iterable args: arguments
+        :param dict kwargs: keyword arguments
+        '''
         op_args = [self.roid, op]
         op_args.extend(args)
         return self.protocol.command("ro_method", op_args, kwargs)
@@ -215,7 +222,7 @@ class RemoteObject(object):
         '''
         Remove object on server.
         '''
-        self.protocol.command("ro_close", (self.roid,), {"sync": False})
+        self.protocol.command("ro_close", (self.roid,), {"reply": False})
 
 
     def __del__(self):
@@ -456,6 +463,14 @@ class PrefixDB(RemoteObject):
 
 
 class Connection(object):
+    '''
+    Creates a connection to server.
+
+    Note all method receives a **wait** keyword argument, which default
+    value depends on return type (False in methods which returns always None),
+    which defines whether client should wait for server or not (sync or async
+    request).
+    '''
     def __init__(self, host, database, timeout=2, green=False, bulksize=10,
                  poolsize=10):
         '''
@@ -483,12 +498,9 @@ class Connection(object):
         '''
         Run command on server.
 
-        :param op: operation
-        :type op: basestring
-        :param args: iterable of arguments
-        :type args: iterable
-        :param kwargs: dict-like
-        :type krwargs
+        :param basestring op: operation
+        :param iterable args: arguments
+        :param dict kwargs: keyword arguments
         '''
         return self.protocol.command(op, args, kwargs)
 
@@ -557,7 +569,7 @@ class Connection(object):
         :param bytes key: key to set
         :param bytes value: value to set
         :param bool sync: whether to use synchronous writes
-        ''', sync=False)
+        ''', wait=False)
     delete = remote_method("delete", '''
         Delete the key/value pair for the specified key.
 
@@ -566,7 +578,7 @@ class Connection(object):
 
         :param bytes key: key to delete
         :param bool sync: whether to use synchronous writes
-        ''', sync=False)
+        ''', wait=False)
     write_batch = remote_method("write_batch", '''
         Create a new :py:class:`WriteBatch` instance for this database.
 
@@ -580,7 +592,7 @@ class Connection(object):
         :param bool sync: whether to use synchronous writes
         :return: new :py:class:`WriteBatch` instance
         :rtype: :py:class:`WriteBatch`
-        ''', sync=False)
+        ''', wait=False)
     snapshot = remote_method("snapshot", '''
         Create a new :py:class:`Snapshot` instance for this database.
 
@@ -607,7 +619,7 @@ class Connection(object):
 
         :param bytes start: start key of range to compact (optional)
         :param bytes stop: stop key of range to compact (optional)
-        ''', sync=False)
+        ''', wait=False)
     approximate_size = remote_method("approximate_size", '''
         Return the approximate file system size for the specified range.
 
