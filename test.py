@@ -43,20 +43,26 @@ class TestClient(unittest.TestCase):
         self.assertEqual(None, self.db.get("test"))
 
     def test_iterator(self):
-        data_range = [("key-%05d" % i, str(i)) for i in range(25)]
+        data_range = [("key-%05d" % i, str(i)) for i in range(100)]
+        first_key = data_range[0][0]
+        last_key = data_range[-1][0]
 
-        # put everything into database
         for key, value in data_range:
             self.db.put(key, value, wait=True)
 
-        # iterate through results and compare
-        data = itertools.izip(
-            self.db.iterator(False, data_range[-5][0], data_range[-1][0]),
-            data_range[-5:]
-            )
-        for (k1, v1), (k2, v2) in data:
-            self.assertEqual(k1, k2)
-            self.assertEqual(v1, v2)
+        it = self.db.iterator(False, first_key, last_key, True, True)
+        with it:
+            zipped = itertools.izip(data_range, it)
+            for (key, value), (iter_key, iter_value) in zipped:
+                self.assertEqual(key, iter_key)
+                self.assertEqual(value, iter_value)
+
+        it = self.db.iterator(True, first_key, last_key, True, True)
+        with it:
+            zipped = itertools.izip(reversed(data_range), it)
+            for (key, value), (iter_key, iter_value) in zipped:
+                self.assertEqual(key, iter_key)
+                self.assertEqual(value, iter_value)
 
 
 def benchmark():
@@ -66,7 +72,7 @@ def benchmark():
     address = "tcp://127.0.0.1:%d" % port
     tmpdb = tempfile.mkdtemp()
     dbname = os.path.basename(tmpdb)
-    elements = 100000
+    elements = 10000
 
     print "Current implementation"
     popen = subprocess.Popen((sys.executable, server.__file__, address, "--create-if-missing", tmpdb))
@@ -93,5 +99,5 @@ def benchmark():
 
 
 if __name__ == '__main__':
-    #unittest.main()
-    benchmark()
+    unittest.main()
+    #benchmark()
