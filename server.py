@@ -21,6 +21,7 @@ import time
 import functools
 import itertools
 import collections
+import signal
 
 import msgpack
 import plyvel
@@ -62,8 +63,6 @@ class Database(object):
         "approximate_sizes": (None, ()),
         "delete": (("key",), ("sync",)),
     }
-    optional_kwargs = {"sync", "wait", "bulksize"}
-
     def __init__(self, name, create_if_missing=False, error_if_exists=False,
         paranoid_checks=None, write_buffer_size=None, max_open_files=None,
         lru_cache_size=None, block_size=None, block_restart_interval=None,
@@ -95,6 +94,7 @@ class Database(object):
             "prefixed_db": "Not implemented by server.",
             "write_batch": "Not implemented by server, use 'write' instead.",
             }
+        self.last_numid = 0
         self.remote_objects = {}
         self.remote_objects_lt = collections.OrderedDict()
 
@@ -113,30 +113,45 @@ class Database(object):
         return False
 
     def ro_close(self, roid):
-        remote_object = db.remote_objects.pop(roid)
-        del db.remote_objects_lt[roid]
-        if hasattr(remote_object, "close"):
-            remote_object.close()
+        '''
+        Close remote object
+        '''
+        try:
+            del self.remote_objects_lt[roid]
+            remote_object = self.remote_objects.pop(roid)
+            if hasattr(remote_object, "close"):
+                return remote_object.close()
+        except KeyError:
+            raise ClientException("RemoteObjectInvalidError")
+
+    def ro_bump(self, roid):
+        '''
+        Update last-touched dict for given roid
+        '''
+        try:
+            del self.remote_objects_lt[roid]
+            self.remote_objects_lt[roid] = time.time()
+        except KeyError:
+            raise ClientException("RemoteObjectInvalidError")
 
     def ro_wrapper(self, remote_object, client_id):
         '''
         Call given function with given args kwargs, creates an AsyncIterable
         and store it and returns iterable name. See :py:method:Database.iter_next
         '''
-        # ClientID is attached to iter name to avoid other client taking apart
-        # on extremely busy servers.
-        if self.remote_objects:
-            last_numid, last_client = next(reversed(self.remote_objects)).split(".")
-            numid = (int(last_numid) + 1) % 4294967295 # max uint is 2**32-1
-        else:
-            numid = 0
+        # ClientID is attached to identifier avoiding clients mixing remote
+        # objects on extremely busy servers.
+        self.last_numid = numid = (int(self.last_numid) + 1) % 4294967295 # max uint is 2**32-1
         roid = "%d.%s" % (numid, client_id)
         self.remote_objects[roid] = remote_object
         self.remote_objects_lt[roid] = time.time()
         return remote_object.__class__.__name__, roid
 
     def ro_next(self, roid, howmany, reverse=False):
-        self.remote_objects_lt[roid] = self.remote_objects_lt.pop(roid)
+        '''
+        Call multiple
+        '''
+        self.ro_bump(roid)
         iterable = self.remote_objects[roid]
         if reverse:
             iterable = self._iter_prev(iterable)
@@ -144,18 +159,18 @@ class Database(object):
 
     def ro_method(self, roid, method, *args, **kwargs):
         '''
-
+        Call method on stored remote object
         '''
-        del self.remote_objects_lt[roid]
         if method == "close":
-            data = self.remote_objects.pop(roid).close()
-        else:
-            data = getattr(self.remote_objects[roid], method)(*args, **kwargs)
-            self.remote_objects_lt[roid] = time.time()
-        return data
+            return self.ro_close(roid)
+        self.ro_bump(roid)
+        return getattr(self.remote_objects[roid], method)(*args, **kwargs)
 
     @classmethod
     def _iter_prev(cls, iterable):
+        '''
+        Yield iterable using its `prev` method
+        '''
         try:
             while True:
                 yield iterable.prev()
@@ -199,12 +214,6 @@ class Database(object):
                 raise TypeError(
                     "%s() takes at least %d argument%s (%d given)"
                         % (op, pnargs, "s" if pnargs > 1 else "", gnargs))
-
-        # Discard optional kwargs not accepted by method
-        for k in cls.optional_kwargs:
-            if k in given_kwargs and not k in proto_kwargs:
-                del given_kwargs[k]
-
         return given_args, given_kwargs
 
     def command(self, op, *args, **kwargs):
@@ -226,15 +235,22 @@ class Server(object):
     '''
     Server class.
     '''
-    def __init__(self, listen, dbfiles, timeout = 10, **kwargs):
+    def __init__(self, listen, dbfiles, timeout = 0.5, rotimeout = 10, poolsize=10, **kwargs):
         '''
+        Initialize LevelDB database objects and ZeroMQ sockets.
 
+        :param basestring listen: zmq listen address
+        :param iterable dbfiles: iterable of database paths
+        :param float timeout: seconds after a request will be cut by server
+        :param float rotimeout: seconds of innactivity for a remote object after being garbage collected
+        :param *: extra arguments will be passed to :py:class:Database constructors
         '''
-        self.workers = 10
         self.timeout = timeout
+        self.rotimeout = rotimeout
         self.context = zmq.Context()
-        self.context.setsockopt(zmq.RCVTIMEO, (self.timeout*1000))
-        self.context.setsockopt(zmq.SNDTIMEO, (self.timeout*1000))
+        self.context.setsockopt(zmq.RCVTIMEO, int(self.timeout*1000))
+        self.context.setsockopt(zmq.SNDTIMEO, int(self.timeout*1000))
+        self.context.setsockopt(zmq.LINGER, int(self.timeout*1000))
 
         self.socket = self.context.socket(zmq.ROUTER)
         self.socket.bind(listen)
@@ -242,32 +258,58 @@ class Server(object):
         self.backend = self.context.socket(zmq.DEALER)
         self.backend.bind('inproc://backend')
 
+        self.workers = [self.context.socket(zmq.DEALER) for _ in xrange(poolsize)]
+        for socket in self.workers:
+            socket.connect('inproc://backend')
+
         logger.info("Listening at %s" % listen)
 
         self.dbs = {os.path.basename(path): Database(path, **kwargs)
                     for path in dbfiles}
-        logger.info("Database%s: %s" % ("s" if len(self.dbs) > 1 else "",
-                                        ", ".join(self.dbs)))
-        self._run = False
-        self._running = False
+        self.tasks = []
 
-    def cleaner(self):
+        logger.info("Database%s: %s" % ("s" if len(self.dbs) > 1 else "",
+                                        os.pathsep.join(self.dbs)))
+
+    def janitor(self):
         '''
-        While mainloop is running, perform periodic cleans
+        While mainloop is running, perform periodic cleans or timeout'd
+        remote objects.
         '''
-        while self._running:
-            expiration = time.time() - self.timeout
-            for db in self.dbs.itervalues():
-                db.ro_expire(lt=expiration)
-            gevent.sleep(self.timeout)
+        try:
+            while True:
+                expiration = time.time() - self.rotimeout
+                for db in self.dbs.itervalues():
+                    db.ro_expire(lt=expiration)
+                gevent.sleep(self.rotimeout)
+        except gevent.GreenletExit:
+            logger.info("Bye, janitor.")
 
     def task(self, socket, message):
         '''
-        Respond to given message using given socket.
+        Respond depending on given message using given socket.
+
+        Messages are iterables of the following strings:
+         * id: client id ( for ZeroMQ Router/Dealer interaction)
+         * database name: database basename
+         * database operation: database operation (usually method) will be performed
+         * args and kwargs: msgpack iterable of two elements:
+            * iterable of arguments
+            * dictionary of keyword arguments
+
+        Note the response is written on socked depending if 'wait' keyword
+        argument is not given or evaluates to True.
+
+        :param zmq.Socket socket: Socket where response will be, hopefully, sent.
+        :param iterable message: Iterable of strings for messages.
+
         '''
         # intentionally outside try-except
         id, dbname, dbop = message[:3]
         args, kwargs = msgpack.loads(message[3])
+        do_response = kwargs.pop("wait", True)
+        if "bulksize" in kwargs:
+            del kwargs["bulksize"]
         try:
             data = self.dbs[dbname].command(dbop, *args, **kwargs)
             data_type = "\0"
@@ -280,68 +322,112 @@ class Server(object):
         except BaseException as e:
             data = (e.__class__.__name__, e.args)
             data_type = "\1"
-        if kwargs.get("wait", True):
+        if do_response:
             socket.send_multipart((id, data_type, msgpack.dumps(data)))
 
-    def worker(self):
+    def worker(self, socket):
         '''
-        Server worker
+        Call :py:method:task for every message received from given socket.
+
+        For some messages, a response will be sent using the same socket (see :py:method:task).
+
+        Blocks until exception is raised, expecting a gevent.GreenletExit for terminating gracefully.
+
+        :param zmq.Socket socket: Socket for incoming messages.
         '''
-        socket = self.context.socket(zmq.DEALER)
-        socket.connect('inproc://backend')
-        while self._running:
-            try:
-                message = socket.recv_multipart()
-                self.task(socket, message)
-            except zmq.ZMQError as e:
-                if err.errno == errno.EINTR:
-                    break
-                logger.exception(e)
-            except BaseException as e:
-                logger.exception(e)
+        try:
+            while True:
+                try:
+                    message = socket.recv_multipart()
+                    self.task(socket, message)
+                except zmq.ZMQError as e:
+                    if err.errno == errno.EINTR:
+                        break
+                    logger.exception(e)
+                except gevent.GreenletExit:
+                    raise
+                except BaseException as e:
+                    logger.exception(e)
+        except gevent.GreenletExit:
+            logger.info("Bye, worker.")
 
     def proxy(self, in_socket, out_socket):
-        while self._running:
-            out_socket.send_multipart(in_socket.recv_multipart())
+        '''
+        Takes two sockets and forward messages between them, in one direction.
+
+        Blocks until exception is raised, expecting a gevent.GreenletExit for terminating gracefully.
+
+        :param zmq.Socket in_socket: Socket from messages will be retrieved
+        :param zmq.Socket out_socket: Socket where messages will be sent
+        '''
+        try:
+            while True:
+                out_socket.send_multipart(in_socket.recv_multipart())
+        except gevent.GreenletExit:
+            logger.info("Bye, proxy.")
+
+    def start(self):
+        '''
+        Start server tasks (corroutines).
+
+        The following method (with their own mainloop) are spawned:
+            :py:method:janitor Remote method timeout garbage collectior.
+            :py:method:proxy Two instances: one for ingoing messages and another for outgoing ones.
+            :py:method:worker One handler for each initialized worker socket.
+
+        This method is non-blocking. For a blocking version see :py:method:main method.
+        '''
+        self.stop()
+        tasks = [
+            gevent.spawn(self.janitor),
+            # Proxies
+            gevent.spawn(self.proxy, self.socket, self.backend),
+            gevent.spawn(self.proxy, self.backend, self.socket),
+            ]
+        # Workers
+        tasks.extend(gevent.spawn(self.worker, s) for s in self.workers)
+        self.tasks[:] = tasks
 
     def main(self):
-        self._running = True
-        self._run = True
+        '''
+        Start server (if not already running) and wait until :py:method:stop is called or (unlikely, see :py:method:start) all tasks finish.
+        '''
+        if not self.tasks:
+            self.start()
+        gevent.joinall(self.tasks)
 
-        # Garbage collector
-        gevent.spawn(self.cleaner)
+    def signal(self, signal, frame):
+        '''
+        System signal handler.
 
-        # Proxies
-        gevent.spawn(self.proxy, self.socket, self.backend)
-        gevent.spawn(self.proxy, self.backend, self.socket)
+        Note python signals cannot call :py:meth:stop directly because they don't run on a gevent managed environment, so need to spawn a :py:class:gevent.Greenlet  for :py:meth:stop .
 
-        # Workers
-        for i in xrange(self.workers):
-            gevent.spawn(self.worker)
-
-        # Mainloop
-        while self._run:
-            gevent.sleep(1)
-
-        self._running = False
+        :param int signal: System received signal
+        :param frame frame: Frame object or None
+        '''
+        logger.info("Signal %d received. Stopping." % signal)
+        gevent.spawn(server.stop)
 
     def stop(self):
         '''
-        Send signal to current process for raising interrupting ZMQError.
+        Stop running tasks (corroutines), this means :py:method:main will return (if running) on next gevent switch.
         '''
-        if self._running:
-            self._run = False
-            # Signals are handled by ZMQ and throws ZMQError with errorno EINTR
-            os.kill(os.getpid(), signal.SIGTERM)
+        if self.tasks:
+            gevent.killall(self.tasks)
+            del self.tasks[:]
 
     def close(self):
         '''
-        Stop mainloop if running and close descriptors.
+        Stop tasks if running and close descriptors.
         '''
         self.stop()
+        for socket in self.workers:
+            socket.close()
+        self.backend.close()
         self.socket.close()
         self.context.term()
         logger.info("Server closed.")
+
 
 logger = logging.getLogger(__name__)
 
@@ -349,10 +435,18 @@ logger = logging.getLogger(__name__)
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(version=__version__, description=__app__)
-    parser.add_argument("listen", metavar="tcp://127.0.0.1:5147", help="zmq listen address")
-    parser.add_argument("dbfiles", metavar="level.db", nargs="+", help="database files")
-    parser.add_argument("--create-if-missing", default=False, action="store_true", help="show debug messages")
-    parser.add_argument("--verbose", action="store_true", help="show debug messages")
+    parser.add_argument("listen", metavar="ADDRESS",
+        help="zmq listen address like tcp://127.0.0.1:5147")
+    parser.add_argument("dbfiles", metavar="PATH", nargs="+",
+        help="database directory path")
+    parser.add_argument("--timeout", default=0.5, type=float,
+        metavar="SECONDS", help="request timeout")
+    parser.add_argument("--rotimeout", default=10, type=float,
+        metavar="SECONDS", help="remote object timeout")
+    parser.add_argument("--create-if-missing", default=False,
+        action="store_true", help="create database if not exists")
+    parser.add_argument("--verbose", action="store_true",
+        help="show debug messages")
     args = parser.parse_args()
 
     if args.verbose:
@@ -360,9 +454,13 @@ if __name__ == "__main__":
         logger.addHandler(logging.StreamHandler())
 
     server = Server(args.listen, args.dbfiles,
-        create_if_missing=args.create_if_missing)
+        create_if_missing = args.create_if_missing,
+        timeout = args.timeout,
+        rotimeout = args.rotimeout
+        )
+    signal.signal(signal.SIGTERM, server.signal)
     try:
         server.main()
     except KeyboardInterrupt:
-        print " CTRL+C received. Stoping."
+        logger.info("CTRL+C received. Stopping.")
     server.close()
