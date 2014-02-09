@@ -38,7 +38,14 @@ class CorruptionError(Error):
     pass
 
 
-class IteratorInvalidError(Error):
+class RemoteObjectInvalidError(Error):
+    '''
+    Used for all remote objects when there is no matching object on server.
+    '''
+    pass
+
+
+class IteratorInvalidError(RemoteObjectInvalidError):
     '''
     Used by :py:class:`RawIterator` to signal invalid iterator state.
     '''
@@ -74,137 +81,19 @@ def remote_method(name, doc, *default_args, **default_kwargs):
     return method
 
 
-class CommandProtocol(object):
-    '''
-    LevelDB-server protocol implementation.
-    '''
-    def __init__(self, size, green, host, database, timeout=-1, socket_type=None):
-        if green:
-            import zmq.green as zmq
-            import gevent.queue
-            QueueType = gevent.queue.Queue
-        else:
-            import zmq
-            import Queue as queue
-            QueueType = queue.Queue
-
-        self.database = database
-        self.context = zmq.Context()
-        self.context.setsockopt(zmq.RCVTIMEO, timeout)
-        self.context.setsockopt(zmq.SNDTIMEO, timeout)
-
-        stype = zmq.DEALER if socket_type is None else socket_type
-
-        self.sockets = [self._socket(self.context, stype, host) for _ in xrange(size)]
-        self.sockque = QueueType()
-        self.sockque.queue.extend(self.sockets)
-
-        self.codes = {
-            "\0": self.serialized,
-            "\1": self.exception,
-            "\2": self.remote_object,
-            }
-
-        self.remote_types = {
-            "Iterator": Iterator,
-            "RawIterator": RawIterator,
-            }
-
-        self.remote_type = RemoteObject
-
-    @staticmethod
-    def _socket(context, type, host):
-        socket = context.socket(type)
-        socket.connect(host)
-        return socket
-
-    def close(self):
-        for socket in self.sockets:
-            socket.close()
-        self.context.term()
-
-    def command(self, op, args=(), kwargs={}):
-        '''
-        Run given operation in server.
-        :param zmq.Socket socket: ZeroMQ socket for send and receive
-        :param basestring database: database name
-        :param basestring op: operation name
-        :param tuple args: operation arguments
-        :param dict kwargs: operation keyword arguments
-        :return: data sent by server or None if sync=False
-        :raises: if raised by server and found in module or builtins
-        :raises Exception: if raised by server and not in module or builtins
-        '''
-        socket = self.sockque.get()
-        try:
-            sargs = msgpack.dumps((args, kwargs))
-            socket.send_multipart((self.database, op, sargs))
-            if kwargs.get("wait", True):
-                data_type, data = socket.recv_multipart()
-                return self.codes.get(data_type, self.default)(data, (self, op, args, kwargs))
-        finally:
-            self.sockque.put(socket)
-
-
-    def serialized(self, data, command):
-        '''
-        Convert data sent by server to python objects.
-
-        :param zmq.Socket socket: unused
-        :param basestring data: data received from server
-        :param command:
-        :return: unserialized data
-        '''
-        return msgpack.loads(data)
-
-    def exception(self, data, command):
-        '''
-        Raises exception sent by server.
-
-        :param zmq.Socket socket: unused
-        :param basestring data: data received from server
-        :param command:
-        :raises: if raised by server and found in module or builtins
-        :raises Exception: if raised by server and not in module or builtins
-        '''
-        exc_type, exc_args = msgpack.loads(data)
-        for scope in (globals(), __builtin__.__dict__):
-            if exc_type in scope:
-                raise scope[exc_type](*exc_args)
-        raise Exception(*exc_args)
-
-    def remote_object(self, data, command):
-        '''
-        Yield server results, asynchronously from server.
-
-        :param zmq.Socket socket: socket will be used for subsequent requests
-        :param basestring data: serialized (rotype, roid) tuple send by server
-        :param command:
-        :param dict kwargs: operation keyword arguments, bulksize key is used
-        '''
-        rotype, roid = msgpack.loads(data)
-        return self.remote_types.get(rotype, self.remote_type)(rotype, roid, command)
-
-    def default(self, data, command):
-        '''
-        Send error to logger as this function is reached when no suitable
-        handler is found for server data.
-
-        :param zmq.Socket socket: unused
-        :param basestring data: data received from server
-        :param command:
-        '''
-        logger.error("Could not parse server message %r" % data)
-
-
 class RemoteObject(object):
     '''
-    Object mirrored on server.
+    Client side of object on server.
+
+    Note remote objects are continuously garbage collected on server side, so
+    no object will survive after an inactivity period bigger than the remote
+    object timeout specified on server.
     '''
     def __init__(self, rotype, roid, command):
         self.rotype = rotype
         self.roid = roid
         self.protocol, self._op, self._args, self._kwargs = command
+        self.closed = False
 
     def command(self, op, args=(), kwargs={}):
         '''
@@ -222,8 +111,12 @@ class RemoteObject(object):
         '''
         Remove object on server.
         '''
-        self.protocol.command("ro_close", (self.roid,), {"reply": False})
+        if not self.closed:
+            self.closed = True
+            self.protocol.command("ro_close", (self.roid,), {"wait": False})
 
+    def __repr__(self):
+        return "%s for remote %s>" % (object.__repr__(self)[-1], self.roid)
 
     def __del__(self):
         self.close()
@@ -231,7 +124,7 @@ class RemoteObject(object):
     def __enter__(self):
         return self
 
-    def __exit__(exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
 
@@ -250,21 +143,33 @@ class BaseIterator(RemoteObject):
     def __iter__(self):
         return self
 
-    def _retrieve(self, inverse=False):
-        if not self._cache:
-            cache_reversed = inverse != self._reversed
-            if cache_reversed != self._cache_reversed:
-                self._clear()
-            elif self._exhausted:
-                raise StopIteration
-            args = (self.roid, self.bulksize, cache_reversed)
-            data = self.protocol.command("ro_next", args)
-            self._cache.extend(data)
-            self._cache_reversed = cache_reversed
-            self._exhausted = len(data) < self.bulksize
+    def _retrieve(self, reverse=False):
+        '''
+        If there is no results on self._cache, get more from server.
+        '''
+        if self._cache:
+            return
+
+        if self._exhausted:
+            raise StopIteration
+
+        # Decide if retrieve backwards or not, and clean cache on change
+        reversed = reverse != self._reversed
+        if reversed != self._cache_reversed:
+            self._clear()
+
+        args = (self.roid, self.bulksize, reversed)
+        data = self.protocol.command("ro_next", args)
+        self._exhausted = len(data) < self.bulksize
+        self._cache_reversed = reversed
+        if not data:
+            raise StopIteration
+        self._cache.extend(data)
 
     def _clear(self):
         self._cache.clear()
+        self._exhausted = False
+        self._cache_reversed = False
 
     def next(self):
         '''
@@ -284,7 +189,7 @@ class BaseIterator(RemoteObject):
 
         May raise :py:exc:`IteratorInvalidError`.
         '''
-        self._retrieve(inverse=True)
+        self._retrieve(reverse=True)
         return self._cache.popleft()
 
     seek = remote_method("seek", '''
@@ -462,6 +367,157 @@ class PrefixDB(RemoteObject):
         ''')
 
 
+class CommandProtocol(object):
+    '''
+    LevelDB-server protocol implementation.
+
+    Based on a zmq socket pool for concurrency, compatible with gevent.
+
+    :cvar dict default_codes: dictionary of response typecode handling. Values can be either callables or basestrings refering to instance methods.
+    :cvar default_remote_types: dictionary of remote object constructors.  Values can be either callables or basestrings refering to instance methods.
+
+    :var basestring database: server database
+    :var zmq.Context context: zmq context for sockets
+    :var basestring address: zmq server address
+    :var list sockets: list of zmq.sockets
+    :var Queue sockque: queue (from gevent if green) of sockets
+    :var dict codes: dict of response handlers.
+    :var dict remote_types: dict of remote object constructors.
+    '''
+    default_codes = {
+        "\0": "serialized",
+        "\1": "exception",
+        "\2": "remote_object",
+        }
+
+    default_remote_types = {
+        "Iterator": Iterator,
+        "RawIterator": RawIterator,
+        }
+
+    def __init__(self, pool_size, green, address, database, timeout=-1):
+        '''
+        :param int pool_size: number of sockets aka number of concurrent requests
+        :param bool green: wether use gevent friendly socket and queue
+        :param basestring host: zmq address to connect to
+        :param basestring database: server database name
+        :param float timeout: timeout in seconds for requests
+        '''
+        if green:
+            import zmq.green as zmq
+            import gevent.queue
+            QueueType = gevent.queue.Queue
+        else:
+            import zmq
+            import Queue as queue
+            QueueType = queue.Queue
+
+        self.database = database
+        self.context = zmq.Context()
+        self.context.setsockopt(zmq.RCVTIMEO, max(int(timeout*1000), -1))
+        self.context.setsockopt(zmq.SNDTIMEO, max(int(timeout*1000), -1))
+
+        self.address = address
+        self.sockets = [self._socket(zmq.DEALER) for _ in xrange(pool_size)]
+        self.sockque = QueueType()
+        self.sockque.queue.extend(self.sockets)
+
+        self.codes = {
+            k: getattr(self, v) if isinstance(v, basestring) else v
+            for k, v in self.default_codes.iteritems()
+            }
+
+        self.remote_types = {
+            k: getattr(self, v) if isinstance(v, basestring) else v
+            for k, v in self.default_remote_types.iteritems()
+            }
+
+        self.remote_type = RemoteObject
+
+    def _socket(self, type):
+        '''
+        Initialize socket for current context
+        '''
+        socket = self.context.socket(type)
+        socket.connect(self.address)
+        return socket
+
+    def close(self):
+        '''
+        Close all sockets and terminate zmq context.
+        '''
+        for socket in self.sockets:
+            socket.close()
+        self.context.term()
+
+    def command(self, op, args=(), kwargs={}):
+        '''
+        Run given operation in server.
+        :param basestring op: operation name
+        :param iterable args: operation arguments
+        :param dict kwargs: operation keyword arguments
+        '''
+        socket = self.sockque.get()
+        try:
+            sargs = msgpack.dumps((args, kwargs))
+            socket.send_multipart((self.database, op, sargs))
+            if kwargs.get("wait", True):
+                data_type, data = socket.recv_multipart()
+                return self.codes.get(data_type, self.default)(data, (self, op, args, kwargs))
+        finally:
+            self.sockque.put(socket)
+
+    def serialized(self, data, command):
+        '''
+        Convert data sent by server to python objects.
+
+        :param zmq.Socket socket: unused
+        :param basestring data: data received from server
+        :param command:
+        :return: unserialized data
+        '''
+        return msgpack.loads(data)
+
+    def exception(self, data, command):
+        '''
+        Raises exception sent by server.
+
+        :param zmq.Socket socket: unused
+        :param basestring data: data received from server
+        :param command:
+        :raises: if raised by server and found in module or builtins
+        :raises Exception: if raised by server and not in module or builtins
+        '''
+        exc_type, exc_args = msgpack.loads(data)
+        for scope in (globals(), __builtin__.__dict__):
+            if exc_type in scope:
+                raise scope[exc_type](*exc_args)
+        raise Exception(*exc_args)
+
+    def remote_object(self, data, command):
+        '''
+        Yield server results, asynchronously from server.
+
+        :param zmq.Socket socket: socket will be used for subsequent requests
+        :param basestring data: serialized (rotype, roid) tuple send by server
+        :param command:
+        :param dict kwargs: operation keyword arguments, bulksize key is used
+        '''
+        rotype, roid = msgpack.loads(data)
+        return self.remote_types.get(rotype, self.remote_type)(rotype, roid, command)
+
+    def default(self, data, command):
+        '''
+        Send error to logger as this function is reached when no suitable
+        handler is found for server data.
+
+        :param zmq.Socket socket: unused
+        :param basestring data: data received from server
+        :param command:
+        '''
+        logger.error("Could not parse server message %r" % data)
+
+
 class Connection(object):
     '''
     Creates a connection to server.
@@ -471,28 +527,20 @@ class Connection(object):
     which defines whether client should wait for server or not (sync or async
     request).
     '''
-    def __init__(self, host, database, timeout=2, green=False, bulksize=10,
+    def __init__(self, address, database, timeout=2, green=False, bulksize=10,
                  poolsize=10):
         '''
-        Initialize client for given host and database.
+        Initialize client for given address and database.
 
-        :param host: server URI
-        :type host: basestring
-        :param database: database name
-        :type database: basestring
-        :param timeout: send and receive socket timeout in seconds
-        :type timeout: int or float
-        :param green: Use ZeroMQ 'green' (greenlet friendly) implementation.
-        :type green: boolean
-        :param bulksize:
-        :param poolsize:
-
+        :param basestring address: server zmq address
+        :param basestring database: database name
+        :param float timeout: send and receive socket timeout in seconds
+        :param bool green: Use ZeroMQ 'green' (greenlet friendly) implementation.
+        :param int bulksize: number of results will be cached by some remote objects methods
+        :param int poolsize: number of concurrent requests
         '''
-        self.host = host
-        self.database = database
         self.bulksize = 10
-        self.protocol = CommandProtocol(poolsize, green, host, database,
-            -1 if timeout == -1 else int(timeout*1000))
+        self.protocol = CommandProtocol(poolsize, green, address, database, timeout)
 
     def command(self, op, args, kwargs):
         '''
