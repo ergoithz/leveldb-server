@@ -362,7 +362,11 @@ class Server(object):
         '''
         try:
             while True:
-                out_socket.send_multipart(in_socket.recv_multipart())
+                try:
+                    out_socket.send_multipart(in_socket.recv_multipart())
+                except zmq.ZMQError as e:
+                    # TODO: handle exception
+                    logger.error("ZMQError received %d: %r." % (e.errno, e.msg))
         except gevent.GreenletExit:
             logger.info("Bye, proxy.")
 
